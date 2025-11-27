@@ -86,17 +86,17 @@ def test_routing():
 def updateInstanceStatus(instance_id):
     dynamodb = boto3.resource("dynamodb", region_name="ca-west-1")
     decision_table = dynamodb.Table("localibou_active_global_vms_table")
+
     response = decision_table.update_item(
         Key={"key": instance_id},
         UpdateExpression="SET #s = :update_status",
         ExpressionAttributeNames={
             "#s": "status"
         },
-        ConditionExpression= ("attribute_exists(#s) AND attribute_exists(key) AND #s = :original_status AND key = :key"),
+        ConditionExpression="#s = :original_status",
         ExpressionAttributeValues={
             ":update_status": "running",
             ":original_status": "init",
-            ":key": instance_id
         },
         ReturnValues="ALL_NEW",
     )
