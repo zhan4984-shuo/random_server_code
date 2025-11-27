@@ -83,13 +83,13 @@ def test_routing():
     finally:
         capacity.increment()
         
-def updateInstanceStatus(instance_id):
+def updateInstanceStatus(instance_id, local_ip):
     dynamodb = boto3.resource("dynamodb", region_name="ca-west-1")
     decision_table = dynamodb.Table("localibou_active_global_vms_table")
 
     response = decision_table.update_item(
         Key={"key": instance_id},
-        UpdateExpression="SET #s = :update_status",
+        UpdateExpression="SET #s = :update_status, public_ip = :public_ip",
         ExpressionAttributeNames={
             "#s": "status"
         },
@@ -97,6 +97,7 @@ def updateInstanceStatus(instance_id):
         ExpressionAttributeValues={
             ":update_status": "running",
             ":original_status": "init",
+            ":public_ip": local_ip
         },
         ReturnValues="ALL_NEW",
     )
@@ -129,9 +130,9 @@ if __name__ == "__main__":
     pass_token_map = {}
     port = int(os.environ.get("PORT", 9000))
     instance_id = get_instance_id()
-    print("-----------------------------------")
-    print(instance_id)
-    res = updateInstanceStatus(instance_id)
-    print("===================================")
-    print(res)
+    local_ip = requests.get(
+        "http://169.254.169.254/latest/meta-data/local-ipv4",
+        timeout=1
+    ).text
+    res = updateInstanceStatus(instance_id, local_ip)
     app.run(host="0.0.0.0", port=port)
