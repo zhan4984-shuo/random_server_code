@@ -124,16 +124,31 @@ def get_instance_id():
     except Exception as e:
         return f"Error getting instance ID: {e}"
 
+def get_public_ip():
+    try:
+        token = requests.put(
+            "http://169.254.169.254/latest/api/token",
+            headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"},
+            timeout=1
+        ).text
+
+        public_ip = requests.get(
+            "http://169.254.169.254/latest/meta-data/public-ipv4",
+            headers={"X-aws-ec2-metadata-token": token},
+            timeout=1
+        ).text
+
+        return public_ip
+    except Exception as e:
+        return f"Error getting public IP: {e}"
+
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     capacity = AtomicInteger(int(sys.argv[1]))
     pass_token_map = {}
     port = int(os.environ.get("PORT", 9000))
     instance_id = get_instance_id()
-    local_ip = requests.get(
-        "http://169.254.169.254/latest/meta-data/local-ipv4",
-        timeout=1
-    ).text
+    local_ip = get_public_ip()
     print(local_ip)
     res = updateInstanceStatus(instance_id, local_ip)
     app.run(host="0.0.0.0", port=port)
