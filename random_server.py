@@ -134,5 +134,6 @@ if __name__ == "__main__":
         "http://169.254.169.254/latest/meta-data/local-ipv4",
         timeout=1
     ).text
+    print(local_ip)
     res = updateInstanceStatus(instance_id, local_ip)
     app.run(host="0.0.0.0", port=port)
