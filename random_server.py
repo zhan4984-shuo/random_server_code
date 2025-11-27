@@ -129,5 +129,7 @@ if __name__ == "__main__":
     pass_token_map = {}
     port = int(os.environ.get("PORT", 8080))
     instance_id = get_instance_id()
-    updateInstanceStatus(instance_id)
+    print(instance_id)
+    res = updateInstanceStatus(instance_id)
+    print(res)
     app.run(host="0.0.0.0", port=port)
