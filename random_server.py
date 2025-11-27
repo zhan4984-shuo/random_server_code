@@ -16,6 +16,7 @@ import json
 import multiprocessing as mp
 from typing import List, Dict, Any
 
+import boto3
 import requests
 from flask import Flask, jsonify, request
 
@@ -81,10 +82,52 @@ def test_routing():
         return {"status": "fail"}
     finally:
         capacity.increment()
+        
+def updateInstanceStatus(instance_id):
+    dynamodb = boto3.resource("dynamodb", region_name="ca-west-1")
+    decision_table = dynamodb.Table("localibou_active_global_vms_table")
+    response = decision_table.update_item(
+        Key={"key": instance_id},
+        UpdateExpression="SET #s = :update_status",
+        ExpressionAttributeNames={
+            "#s": "status"
+        },
+        ConditionExpression= ("attribute_exists(#s) AND attribute_exists(key) AND #s = :original_status AND key = :key"),
+        ExpressionAttributeValues={
+            ":update_status": "running",
+            ":original_status": "init",
+            ":key": instance_id
+        },
+        ReturnValues="ALL_NEW",
+    )
+    return response
+
+def get_instance_id():
+    try:
+        # Get token
+        token = requests.put(
+            "http://169.254.169.254/latest/api/token",
+            headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"},
+            timeout=1
+        ).text
+
+        # Get instance-id
+        instance_id = requests.get(
+            "http://169.254.169.254/latest/meta-data/instance-id",
+            headers={"X-aws-ec2-metadata-token": token},
+            timeout=1
+        ).text
+
+        return instance_id
+
+    except Exception as e:
+        return f"Error getting instance ID: {e}"
 
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     capacity = AtomicInteger(int(sys.argv[1]))
     pass_token_map = {}
     port = int(os.environ.get("PORT", 8080))
+    instance_id = get_instance_id()
+    updateInstanceStatus(instance_id)
     app.run(host="0.0.0.0", port=port)
