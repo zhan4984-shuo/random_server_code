@@ -127,7 +127,7 @@ def get_instance_id():
 if __name__ == "__main__":
     capacity = AtomicInteger(int(sys.argv[1]))
     pass_token_map = {}
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.environ.get("PORT", 9000))
     instance_id = get_instance_id()
     print("-----------------------------------")
     print(instance_id)
