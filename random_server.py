@@ -45,10 +45,34 @@ class AtomicInteger:
     def get_value(self):
         with self._lock:
             return self._value
+        
+class TimeoutCache:
+    def __init__(self):
+        self.store = {}
 
-@app.route("/pre_occupy", methods=["POST"])
+    def get(self, key):
+        now = time.time()
+        if key in self.store.keys():
+            timestamp = self.store[key]
+            if now <= timestamp:
+                self.store.pop(key, None)
+                return True 
+        return False
+    
+    def put(self, key, ttl):
+        now = time.time()
+        self.store[key] = ttl + now
+        return ttl + now
+    
+    def remove(self, key):
+        self.store.pop(key, None)
+    
+
+@app.route("/rlb/reserve", methods=["POST"])
 def pre_occupy():
     global capacity
+    request_data = request.get_json()
+    ttl = int(request_data["reserve_timeout_sec"])
     if capacity.get_value() > 0:
         remaining = capacity.decrement()
         if remaining < 0:
@@ -57,23 +81,24 @@ def pre_occupy():
         else:
             new_uuid = str(uuid.uuid4())
             # add expire later
-            pass_token_map[new_uuid] = ""
+            expired_time = pass_token_map.put(new_uuid, ttl)
             return {
                     "status":"success",
                     "token":new_uuid,
+                    "expired_time": expired_time
                     }
     return {"status": "fail"}
 
 
 # Should we return error if no space
-@app.route("/test_routing", methods=["POST"])
-def test_routing():
+@app.route("/rlb/execute", methods=["POST"])
+def execute():
     try:
         url = "http://localhost:8080/2015-03-31/functions/function/invocations"
         request_data = request.get_json()
-        data = request_data["data"]
+        data = request_data["payload"]
         token = request_data["token"]
-        if token not in pass_token_map.keys():
+        if not pass_token_map.get(token):
             return {"status": "fail", "message": "You do not get the token to run this function"}
         response = requests.post(url, json=data)
         return response.json()
@@ -81,7 +106,35 @@ def test_routing():
         print(e)
         return {"status": "fail"}
     finally:
+        pass_token_map.remove(token)
         capacity.increment()
+        
+# Should we return error if no space
+@app.route("/rlb/execute_withou_reserve", methods=["POST"])
+def execute_withou_reserve():
+    try:
+        global capacity
+        if capacity.get_value() > 0:
+            remaining = capacity.decrement()
+            if remaining < 0:
+                capacity.increment()
+                return {"status":"fail"}
+            else:
+                new_uuid = str(uuid.uuid4())
+                # add expire later
+                pass_token_map.put(new_uuid, 2)
+                url = "http://localhost:8080/2015-03-31/functions/function/invocations"
+                request_data = request.get_json()
+                data = request_data["payload"]
+                response = requests.post(url, json=data)
+                pass_token_map.remove(new_uuid)
+                capacity.increment()
+                return response.json()
+    except Exception as e:
+        print(e)
+        pass_token_map.remove(new_uuid)
+        capacity.increment()
+        return {"status": "fail"}
         
 def updateInstanceStatus(instance_id, local_ip):
     dynamodb = boto3.resource("dynamodb", region_name="ca-west-1")
@@ -145,7 +198,7 @@ def get_public_ip():
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     capacity = AtomicInteger(int(sys.argv[1]))
-    pass_token_map = {}
+    pass_token_map = TimeoutCache()
     port = int(os.environ.get("PORT", 9000))
     instance_id = get_instance_id()
     local_ip = get_public_ip()
