@@ -102,10 +102,10 @@ def pre_occupy():
 # Should we return error if no space
 @app.route("/rlb/execute", methods=["POST"])
 def execute():
+    request_data = request.get_json()
     token = request_data["token"]
     try:
         url = "http://localhost:8080/2015-03-31/functions/function/invocations"
-        request_data = request.get_json()
         data = request_data["payload"]
         if not pass_token_map.get(token):
             return {"status": "fail", "message": "You do not get the token to run this function"}
