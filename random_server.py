@@ -66,12 +66,19 @@ class TimeoutCache:
     
     def remove(self, key):
         self.store.pop(key, None)
+        
+    def clear(self):
+        now = time.time()
+        for key, value in self.store.items():
+            if now > value:
+                self.store.pop(key, None)
+                capacity.increment()
     
 
 @app.route("/rlb/reserve", methods=["POST"])
 def pre_occupy():
-    global capacity
     request_data = request.get_json()
+    pass_token_map.clear()
     ttl = int(request_data["reserve_timeout_sec"])
     if capacity.get_value() > 0:
         remaining = capacity.decrement()
@@ -114,7 +121,7 @@ def execute():
 @app.route("/rlb/execute_withou_reserve", methods=["POST"])
 def execute_withou_reserve():
     try:
-        global capacity
+        pass_token_map.clear()
         if capacity.get_value() > 0:
             remaining = capacity.decrement()
             if remaining < 0:
