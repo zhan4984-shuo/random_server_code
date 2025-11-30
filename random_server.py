@@ -19,13 +19,12 @@ from typing import List, Dict, Any
 import boto3
 import requests
 from flask import Flask, jsonify, request
+import threading
 
 app = Flask(__name__)
 container_uuid = str(uuid.uuid4())
 request_count = 0
 
-
-import threading
 
 class AtomicInteger:
     def __init__(self, initial_value=0):
@@ -45,36 +44,43 @@ class AtomicInteger:
     def get_value(self):
         with self._lock:
             return self._value
-        
+
+
 class TimeoutCache:
     def __init__(self):
         self.store = {}
 
     def get(self, key):
+        """Return True if key is valid (and consume it), False otherwise."""
         now = time.time()
-        if key in self.store.keys():
-            timestamp = self.store[key]
-            if now <= timestamp:
-                self.store.pop(key, None)
-                return True 
-        return False
-    
+        expiry = self.store.get(key)
+        if expiry is None:
+            return False
+        if now > expiry:
+            # expired: clean it up
+            self.store.pop(key, None)
+            return False
+        return True
+
     def put(self, key, ttl):
         now = time.time()
         expiry = now + float(ttl)
         self.store[key] = expiry
         return expiry
-    
+
     def remove(self, key):
         self.store.pop(key, None)
-        
+
     def clear(self):
+        """Remove expired keys and give capacity back."""
         now = time.time()
-        for key, value in self.store.items():
-            if now > value:
+        # copy items first to avoid dict-size-change error
+        for key, expiry in list(self.store.items()):
+            if now > expiry:
                 self.store.pop(key, None)
+                # capacity is a global AtomicInteger
                 capacity.increment()
-    
+
 
 @app.route("/rlb/reserve", methods=["POST"])
 def pre_occupy():
@@ -86,16 +92,16 @@ def pre_occupy():
         if remaining < 0:
             capacity.increment()
             print()
-            return {"status":"fail"}
+            return {"status": "fail"}
         else:
             new_uuid = str(uuid.uuid4())
             # add expire later
             expired_time = pass_token_map.put(new_uuid, ttl)
             return {
-                    "status":"success",
-                    "token":new_uuid,
-                    "expired_time": expired_time
-                    }
+                "status": "success",
+                "token": new_uuid,
+                "expired_time": expired_time,
+            }
     return {"status": "fail"}
 
 
@@ -108,27 +114,34 @@ def execute():
         url = "http://localhost:8080/2015-03-31/functions/function/invocations"
         data = request_data["payload"]
         if not pass_token_map.get(token):
-            return {"status": "fail", "message": "You do not get the token to run this function"}
+            return {
+                "status": "fail",
+                "message": "You do not get the token to run this function",
+            }
         response = requests.post(url, json=data)
         return response.json()
     except Exception as e:
         print(e)
         return {"status": "fail"}
     finally:
+        # safe even if already removed
         pass_token_map.remove(token)
         capacity.increment()
-        
+
+
 # Should we return error if no space
-@app.route("/rlb/execute_withou_reserve", methods=["POST"])
-def execute_withou_reserve():
+@app.route("/rlb/execute_without_reserve", methods=["POST"])
+def execute_without_reserve():
+    new_uuid = None
     try:
         pass_token_map.clear()
-        if capacity.get_value() > 0:
+        current_capacity = capacity.get_value()
+        if current_capacity > 0:
             remaining = capacity.decrement()
             if remaining < 0:
-                print("no remaining capacity when decr" + str(remaining))
+                print("no remaining capacity when decr " + str(remaining))
                 capacity.increment()
-                return {"status":"fail"}
+                return {"status": "fail"}
             else:
                 new_uuid = str(uuid.uuid4())
                 # add expire later
@@ -140,13 +153,16 @@ def execute_withou_reserve():
                 pass_token_map.remove(new_uuid)
                 capacity.increment()
                 return response.json()
-        print("no remaining capacity when check" + str(remaining))
+        print("no remaining capacity when check " + str(current_capacity))
+        return {"status": "fail"}
     except Exception as e:
         print(e)
-        pass_token_map.remove(new_uuid)
+        if new_uuid is not None:
+            pass_token_map.remove(new_uuid)
         capacity.increment()
         return {"status": "fail"}
-        
+
+
 def updateInstanceStatus(instance_id, local_ip):
     dynamodb = boto3.resource("dynamodb", region_name="ca-west-1")
     decision_table = dynamodb.Table("localibou_active_global_vms_table")
@@ -154,18 +170,17 @@ def updateInstanceStatus(instance_id, local_ip):
     response = decision_table.update_item(
         Key={"key": instance_id},
         UpdateExpression="SET #s = :update_status, public_ip = :public_ip",
-        ExpressionAttributeNames={
-            "#s": "status"
-        },
+        ExpressionAttributeNames={"#s": "status"},
         ConditionExpression="#s = :original_status",
         ExpressionAttributeValues={
             ":update_status": "running",
             ":original_status": "init",
-            ":public_ip": local_ip
+            ":public_ip": local_ip,
         },
         ReturnValues="ALL_NEW",
     )
     return response
+
 
 def get_instance_id():
     try:
@@ -173,14 +188,14 @@ def get_instance_id():
         token = requests.put(
             "http://169.254.169.254/latest/api/token",
             headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"},
-            timeout=1
+            timeout=1,
         ).text
 
         # Get instance-id
         instance_id = requests.get(
             "http://169.254.169.254/latest/meta-data/instance-id",
             headers={"X-aws-ec2-metadata-token": token},
-            timeout=1
+            timeout=1,
         ).text
 
         return instance_id
@@ -188,26 +203,31 @@ def get_instance_id():
     except Exception as e:
         return f"Error getting instance ID: {e}"
 
+
 def get_public_ip():
     try:
         token = requests.put(
             "http://169.254.169.254/latest/api/token",
             headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"},
-            timeout=1
+            timeout=1,
         ).text
 
         public_ip = requests.get(
             "http://169.254.169.254/latest/meta-data/public-ipv4",
             headers={"X-aws-ec2-metadata-token": token},
-            timeout=1
+            timeout=1,
         ).text
 
         return public_ip
     except Exception as e:
         return f"Error getting public IP: {e}"
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        raise SystemExit("Usage: python random_server.py <capacity>")
+
     capacity = AtomicInteger(int(sys.argv[1]))
     pass_token_map = TimeoutCache()
     port = int(os.environ.get("PORT", 9000))
@@ -215,4 +235,5 @@ if __name__ == "__main__":
     local_ip = get_public_ip()
     print(local_ip)
     res = updateInstanceStatus(instance_id, local_ip)
+    print(res)
     app.run(host="0.0.0.0", port=port)
