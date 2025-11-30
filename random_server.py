@@ -110,6 +110,7 @@ def pre_occupy():
 def execute():
     request_data = request.get_json()
     token = request_data["token"]
+    eventType = request_data["eventType"]
     try:
         url = "http://localhost:8080/2015-03-31/functions/function/invocations"
         data = request_data["payload"]
@@ -118,21 +119,32 @@ def execute():
                 "status": "fail",
                 "message": "You do not get the token to run this function",
             }
-        response = requests.post(url, json=data)
-        return response.json()
+        if eventType == "sync":
+            response = requests.post(url, json=data)
+            return response.json()
+        t = threading.Thread(target=post_and_return, args=(url, data, token), daemon=False)
+        t.start()
+        return {"status": "success"}
     except Exception as e:
         print(e)
         return {"status": "fail"}
     finally:
         # safe even if already removed
-        pass_token_map.remove(token)
-        capacity.increment()
+        if eventType == "sync":
+            pass_token_map.remove(token)
+            capacity.increment()
 
+def post_and_return(url, data, token):
+    response = requests.post(url, json=data)
+    pass_token_map.remove(token)
+    capacity.increment()
+    return response.json()
 
 # Should we return error if no space
 @app.route("/rlb/execute_without_reserve", methods=["POST"])
 def execute_without_reserve():
     new_uuid = None
+    eventType = request_data["eventType"]
     try:
         pass_token_map.clear()
         current_capacity = capacity.get_value()
@@ -149,10 +161,15 @@ def execute_without_reserve():
                 url = "http://localhost:8080/2015-03-31/functions/function/invocations"
                 request_data = request.get_json()
                 data = request_data["payload"]
-                response = requests.post(url, json=data)
-                pass_token_map.remove(new_uuid)
-                capacity.increment()
-                return response.json()
+                if eventType == "sync":
+                    response = requests.post(url, json=data)
+                    pass_token_map.remove(new_uuid)
+                    capacity.increment()
+                    return response.json()
+                else:
+                    t = threading.Thread(target=post_and_return, args=(url, data, new_uuid), daemon=False)
+                    t.start()
+                    return {"status": "success"}
         print("no remaining capacity when check " + str(current_capacity))
         return {"status": "fail"}
     except Exception as e:
