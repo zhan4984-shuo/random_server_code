@@ -61,8 +61,9 @@ class TimeoutCache:
     
     def put(self, key, ttl):
         now = time.time()
-        self.store[key] = ttl + now
-        return ttl + now
+        expiry = now + float(ttl)
+        self.store[key] = expiry
+        return expiry
     
     def remove(self, key):
         self.store.pop(key, None)
@@ -101,11 +102,11 @@ def pre_occupy():
 # Should we return error if no space
 @app.route("/rlb/execute", methods=["POST"])
 def execute():
+    token = request_data["token"]
     try:
         url = "http://localhost:8080/2015-03-31/functions/function/invocations"
         request_data = request.get_json()
         data = request_data["payload"]
-        token = request_data["token"]
         if not pass_token_map.get(token):
             return {"status": "fail", "message": "You do not get the token to run this function"}
         response = requests.post(url, json=data)
