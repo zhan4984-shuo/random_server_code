@@ -77,6 +77,7 @@ def pre_occupy():
         remaining = capacity.decrement()
         if remaining < 0:
             capacity.increment()
+            print()
             return {"status":"fail"}
         else:
             new_uuid = str(uuid.uuid4())
@@ -117,6 +118,7 @@ def execute_withou_reserve():
         if capacity.get_value() > 0:
             remaining = capacity.decrement()
             if remaining < 0:
+                print("no remaining capacity when decr" + str(remaining))
                 capacity.increment()
                 return {"status":"fail"}
             else:
@@ -130,6 +132,7 @@ def execute_withou_reserve():
                 pass_token_map.remove(new_uuid)
                 capacity.increment()
                 return response.json()
+        print("no remaining capacity when check" + str(remaining))
     except Exception as e:
         print(e)
         pass_token_map.remove(new_uuid)
