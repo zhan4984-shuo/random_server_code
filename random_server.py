@@ -202,7 +202,7 @@ def get_public_ip():
 if __name__ == "__main__":
     capacity = AtomicInteger(int(sys.argv[1]))
     pass_token_map = TimeoutCache()
-    port = int(os.environ.get("PORT", 9001))
+    port = int(os.environ.get("PORT", 9000))
     instance_id = get_instance_id()
     local_ip = get_public_ip()
     print(local_ip)
