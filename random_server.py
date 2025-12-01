@@ -273,6 +273,6 @@ if __name__ == "__main__":
         attrs = res["Attributes"]
         region = attrs["region"]
         workflow_id = attrs["workflow_id"]
-        create_new_machine_history(instance_id, region, workflow_id, "running")
+        update_running_new_machine_history(instance_id)
     print(res)
     app.run(host="0.0.0.0", port=port)
