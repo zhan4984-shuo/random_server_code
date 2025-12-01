@@ -198,6 +198,24 @@ def updateInstanceStatus(instance_id, local_ip):
     )
     return response
 
+def create_new_machine_history(instance_id, region, workfload_id, status):
+    ms = time.time_ns() // 1_000_000
+    try: 
+        dynamodb = boto3.resource("dynamodb", region_name="ca-west-1")
+        table = dynamodb.Table("localibou_ec2_status_history_log")
+        item = {
+            "ec2_id": instance_id,
+            "statis": status,
+            "region": "aws:" + region,
+            "workfload_id": workfload_id,
+            "timestamp": ms
+        }
+        response = table.put_item(Item=item)
+        return response
+    except Exception as e:
+        print(e)
+        return None
+
 
 def get_instance_id():
     try:
@@ -252,5 +270,10 @@ if __name__ == "__main__":
     local_ip = get_public_ip()
     print(local_ip)
     res = updateInstanceStatus(instance_id, local_ip)
+    if res is not None:
+        attrs = res["Attributes"]
+        region = attrs["region"]
+        workflow_id = attrs["workflow_id"]
+        create_new_machine_history(instance_id, region, workflow_id, "running")
     print(res)
     app.run(host="0.0.0.0", port=port)
