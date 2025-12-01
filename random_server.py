@@ -204,7 +204,7 @@ def update_running_new_machine_history(instance_id):
         dynamodb = boto3.resource("dynamodb", region_name="ca-west-1")
         table = dynamodb.Table("localibou_ec2_status_history_log")
         response = table.update_item(
-            Key={"key": instance_id},            # your primary key
+            Key={"ec2_id": instance_id},            # your primary key
             UpdateExpression="SET running_time = :t",
             ExpressionAttributeValues={
                 ":t": ms
@@ -266,6 +266,7 @@ if __name__ == "__main__":
     pass_token_map = TimeoutCache()
     port = int(os.environ.get("PORT", 9000))
     instance_id = get_instance_id()
+    print("instance_id: " + str(instance_id))
     local_ip = get_public_ip()
     print(local_ip)
     res = updateInstanceStatus(instance_id, local_ip)
