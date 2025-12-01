@@ -198,19 +198,18 @@ def updateInstanceStatus(instance_id, local_ip):
     )
     return response
 
-def create_new_machine_history(instance_id, region, workfload_id, status):
+def update_running_new_machine_history(instance_id):
     ms = time.time_ns() // 1_000_000
     try: 
         dynamodb = boto3.resource("dynamodb", region_name="ca-west-1")
         table = dynamodb.Table("localibou_ec2_status_history_log")
-        item = {
-            "ec2_id": instance_id,
-            "statis": status,
-            "region": "aws:" + region,
-            "workfload_id": workfload_id,
-            "timestamp": ms
-        }
-        response = table.put_item(Item=item)
+        response = table.update_item(
+            Key={"key": instance_id},            # your primary key
+            UpdateExpression="SET running_time = :t",
+            ExpressionAttributeValues={
+                ":t": ms
+            },
+        )
         return response
     except Exception as e:
         print(e)
