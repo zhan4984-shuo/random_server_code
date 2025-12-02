@@ -206,8 +206,8 @@ def pre_occupy():
     - 如果有空闲 capacity + backend，就返回 token
     - 否则返回 fail
     """
-    print(request_data)
     request_data = request.get_json()
+    print(request_data)
     pass_token_map.clear()
     ttl = int(request_data["reserve_timeout_sec"])
 
@@ -249,8 +249,8 @@ def execute():
     - sync: 阻塞直到 Lambda 返回，返回结果
     - async: 后台线程执行，立刻返回 {"status": "success"}
     """
-    print(request_data)
     request_data = request.get_json()
+    print(request_data)
     token = request_data["token"]
     eventType = request_data["eventType"]
     try:
@@ -332,6 +332,7 @@ def execute_without_reserve():
     new_uuid = None
     try:
         request_data = request.get_json()
+        print(request_data)
         eventType = request_data["eventType"]
         pass_token_map.clear()
         current_capacity = capacity.get_value()
