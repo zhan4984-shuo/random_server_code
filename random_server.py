@@ -2,6 +2,12 @@
 """
 Random server that fronts multiple Lambda containers (RIE) and forwards
 requests to them with capacity + token control.
+
+- 启动方式: python3 random_server.py <capacity>
+    capacity = 本机容器数量（replicas）
+- 需要环境变量:
+    BACKEND_BASE_PORT: 第一个容器映射的 host 端口 (默认 8080)
+    BACKEND_HOST: 容器 host 地址 (默认 localhost)
 """
 
 import os
@@ -13,13 +19,12 @@ from typing import List, Dict, Any
 
 import boto3
 import requests
-from flask import Flask, jsonify, request
-import threading  # NEW: 用于各种锁
+from flask import Flask, request
+import threading
 
 app = Flask(__name__)
 container_uuid = str(uuid.uuid4())
 request_count = 0
-
 
 # ─────────────────────────────────────────
 # 基础并发原语
@@ -47,9 +52,9 @@ class AtomicInteger:
 
 class BackendSlot:
     """
-    NEW: 每个容器对应一个 backend slot：
+    每个容器对应一个 backend slot：
     - url: 这个容器的 invocations URL（带 host:port）
-    - lock: 保证单容器单并发
+    - lock: 保证该容器单并发
     - busy: 是否已被某个 token 占用
     """
     def __init__(self, url: str):
@@ -59,28 +64,45 @@ class BackendSlot:
 
 
 # 全局：backend 列表 + token -> backend 映射
-backends: List[BackendSlot] = []          # NEW
-token_backend_map: Dict[str, int] = {}    # NEW: token -> backend 索引
-token_backend_lock = threading.Lock()     # NEW: 保护 map
-capacity: AtomicInteger                   # 在 main 里初始化
+backends: List[BackendSlot] = []
+token_backend_map: Dict[str, int] = {}
+token_backend_lock = threading.Lock()
+capacity: AtomicInteger  # 在 main 里初始化
+
+# round-robin 起点
+next_backend_index = 0
 
 
 def assign_backend_for_token(token: str) -> BackendSlot:
     """
-    NEW: 为一个 token 选一个空闲 backend，并标记 busy。
-    如果没有空闲 backend，返回 None。
+    为一个 token 选一个 backend（round-robin）：
+    - 从 next_backend_index 开始绕一圈
+    - 找到第一个 not busy 的 backend
+    - 标记为 busy，并更新 next_backend_index
     """
+    global next_backend_index
     with token_backend_lock:
-        for idx, backend in enumerate(backends):
+        n = len(backends)
+        if n == 0:
+            return None
+
+        start = next_backend_index
+        for offset in range(n):
+            idx = (start + offset) % n
+            backend = backends[idx]
             if not backend.busy:
                 backend.busy = True
                 token_backend_map[token] = idx
+                # 下次从这个 backend 的下一个开始
+                next_backend_index = (idx + 1) % n
                 return backend
-    return None
+
+        # 没有空闲 backend
+        return None
 
 
 def get_backend_for_token(token: str) -> BackendSlot:
-    """NEW: 根据 token 找到对应 backend，如果没有则返回 None。"""
+    """根据 token 找到对应 backend，如果没有则返回 None。"""
     with token_backend_lock:
         idx = token_backend_map.get(token)
     if idx is None or not (0 <= idx < len(backends)):
@@ -89,7 +111,7 @@ def get_backend_for_token(token: str) -> BackendSlot:
 
 
 def release_backend_for_token(token: str) -> None:
-    """NEW: 释放 token 关联的 backend，让它可以重新被使用。"""
+    """释放 token 关联的 backend，让它可以重新被使用。"""
     with token_backend_lock:
         idx = token_backend_map.pop(token, None)
     if idx is not None and 0 <= idx < len(backends):
@@ -106,7 +128,7 @@ class TimeoutCache:
     """
     def __init__(self):
         self.store = {}
-        self._lock = threading.Lock()  # NEW: 线程安全
+        self._lock = threading.Lock()
 
     def get(self, key):
         """Return True if key is valid (not expired), False otherwise."""
@@ -116,7 +138,7 @@ class TimeoutCache:
             if expiry is None:
                 return False
             if now > expiry:
-                # expired: 清理但不在这里还 capacity，集中在 clear() 做
+                # 过期了，只在这里删除，不在这里还 capacity
                 self.store.pop(key, None)
                 return False
             return True
@@ -151,19 +173,18 @@ class TimeoutCache:
                     self.store.pop(key, None)
                     expired_keys.append(key)
 
-        # 在锁外释放资源，避免长时间持锁
+        # 在锁外做释放
         for key in expired_keys:
             capacity.increment()
             release_backend_for_token(key)
 
 
-# 这两个会在 main 里初始化
-pass_token_map: TimeoutCache  # type: ignore
+pass_token_map: TimeoutCache  # 在 main 里初始化
 
 
 def cleanup_token(token: str):
     """
-    NEW: 统一 token 清理逻辑：
+    统一 token 清理逻辑：
     - 从 TimeoutCache 删除
     - capacity +1
     - 释放 backend
@@ -189,7 +210,6 @@ def pre_occupy():
     pass_token_map.clear()
     ttl = int(request_data["reserve_timeout_sec"])
 
-    # 先看 capacity
     if capacity.get_value() > 0:
         remaining = capacity.decrement()
         if remaining < 0:
@@ -198,14 +218,12 @@ def pre_occupy():
         else:
             new_uuid = str(uuid.uuid4())
 
-            # NEW: 为这个 token 分配一个 backend
             backend = assign_backend_for_token(new_uuid)
             if backend is None:
-                # 理论上不应该发生，如果发生说明 backend 状态脏了，回滚 capacity
+                # backend 不够，回滚 capacity
                 capacity.increment()
                 return {"status": "fail"}
 
-            # 写入 TTL
             expired_time = pass_token_map.put(new_uuid, ttl)
             return {
                 "status": "success",
@@ -220,7 +238,7 @@ def execute():
     """
     使用预留的 token 执行：
     - sync: 阻塞直到 Lambda 返回，返回结果
-    - async: 后台线程执行，立即返回 {"status": "success"}
+    - async: 后台线程执行，立刻返回 {"status": "success"}
     """
     request_data = request.get_json()
     token = request_data["token"]
@@ -232,7 +250,7 @@ def execute():
                 "message": "You do not get the token to run this function",
             }
 
-        backend = get_backend_for_token(token)  # NEW: 找到具体哪一个容器
+        backend = get_backend_for_token(token)
         if backend is None:
             return {
                 "status": "fail",
@@ -242,14 +260,13 @@ def execute():
         data = request_data["payload"]
 
         if eventType == "sync":
-            # NEW: 对这个 backend 加锁，保证单容器单并发
             with backend.lock:
                 response = requests.post(backend.url, json=data)
             result = response.json()
-            cleanup_token(token)  # 同步调用结束后释放
+            cleanup_token(token)
             return result
 
-        # async: 起线程执行，但还是按 backend.lock 串行这个容器
+        # async
         t = threading.Thread(
             target=post_and_return,
             args=(token, data),
@@ -259,7 +276,6 @@ def execute():
         return {"status": "success"}
     except Exception as e:
         print(e)
-        # sync 出异常也要释放资源
         if eventType == "sync":
             cleanup_token(token)
         return {"status": "fail"}
@@ -278,7 +294,7 @@ def post_and_return(token, data):
             return
         with backend.lock:
             response = requests.post(backend.url, json=data)
-        _ = response.json()  # 目前没用到结果，保留接口
+        _ = response.json()
     except Exception as e:
         print(e)
     finally:
@@ -293,7 +309,7 @@ def execute_without_reserve():
     """
     new_uuid = None
     try:
-        request_data = request.get_json()  # CHANGED: 先读 request_data
+        request_data = request.get_json()
         eventType = request_data["eventType"]
         pass_token_map.clear()
         current_capacity = capacity.get_value()
@@ -306,13 +322,12 @@ def execute_without_reserve():
             else:
                 new_uuid = str(uuid.uuid4())
 
-                # NEW: 为这个 token 分配 backend
                 backend = assign_backend_for_token(new_uuid)
                 if backend is None:
                     capacity.increment()
                     return {"status": "fail"}
 
-                # TTL 固定写个 2 秒（保留你原来逻辑）
+                # 固定 TTL=2 秒，保持你原来的逻辑
                 pass_token_map.put(new_uuid, 2)
                 data = request_data["payload"]
 
@@ -340,7 +355,7 @@ def execute_without_reserve():
 
 
 # ─────────────────────────────────────────
-# DynamoDB / 实例状态相关逻辑（基本保持不变）
+# DynamoDB / 实例状态相关逻辑
 # ─────────────────────────────────────────
 
 def updateInstanceStatus(instance_id, local_ip):
@@ -368,11 +383,9 @@ def update_running_new_machine_history(instance_id):
         dynamodb = boto3.resource("dynamodb", region_name="ca-west-1")
         table = dynamodb.Table("localibou_ec2_status_history_log")
         response = table.update_item(
-            Key={"ec2_id": instance_id},  # your primary key
+            Key={"ec2_id": instance_id},
             UpdateExpression="SET running_time = :t",
-            ExpressionAttributeValues={
-                ":t": ms
-            },
+            ExpressionAttributeValues={":t": ms},
         )
         return response
     except Exception as e:
@@ -382,14 +395,12 @@ def update_running_new_machine_history(instance_id):
 
 def get_instance_id():
     try:
-        # Get token
         token = requests.put(
             "http://169.254.169.254/latest/api/token",
             headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"},
             timeout=1,
         ).text
 
-        # Get instance-id
         instance_id = requests.get(
             "http://169.254.169.254/latest/meta-data/instance-id",
             headers={"X-aws-ec2-metadata-token": token},
@@ -429,14 +440,15 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         raise SystemExit("Usage: python random_server.py <capacity>")
 
-    capacity_value = int(sys.argv[1])               # capacity = 容器数
+    capacity_value = int(sys.argv[1])  # capacity = 容器数（replicas）
     capacity = AtomicInteger(capacity_value)
     pass_token_map = TimeoutCache()
 
-    # NEW: 根据环境变量 BACKEND_BASE_PORT & BACKEND_HOST 构造多个 backend
+    # BACKEND_BASE_PORT: 第一个容器的 host 端口，默认 8080
     base_port = int(os.environ.get("BACKEND_BASE_PORT", "8080"))
     backend_host = os.environ.get("BACKEND_HOST", "localhost")
 
+    # 根据 capacity 建立 backend 列表
     for i in range(capacity_value):
         port = base_port + i
         url = f"http://{backend_host}:{port}/2015-03-31/functions/function/invocations"
@@ -444,9 +456,9 @@ if __name__ == "__main__":
 
     port = int(os.environ.get("PORT", 9000))
     instance_id = get_instance_id()
-    print("instance_id: " + str(instance_id))
+    print("instance_id:", instance_id)
     local_ip = get_public_ip()
-    print(local_ip)
+    print("public_ip:", local_ip)
     res = updateInstanceStatus(instance_id, local_ip)
     if res is not None:
         attrs = res["Attributes"]
