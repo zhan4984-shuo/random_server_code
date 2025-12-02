@@ -206,6 +206,7 @@ def pre_occupy():
     - 如果有空闲 capacity + backend，就返回 token
     - 否则返回 fail
     """
+    print(request_data)
     request_data = request.get_json()
     pass_token_map.clear()
     ttl = int(request_data["reserve_timeout_sec"])
@@ -214,6 +215,7 @@ def pre_occupy():
         remaining = capacity.decrement()
         if remaining < 0:
             capacity.increment()
+            print({"status": "fail"})
             return {"status": "fail"}
         else:
             new_uuid = str(uuid.uuid4())
@@ -222,14 +224,21 @@ def pre_occupy():
             if backend is None:
                 # backend 不够，回滚 capacity
                 capacity.increment()
+                print({"status": "fail"})
                 return {"status": "fail"}
 
             expired_time = pass_token_map.put(new_uuid, ttl)
+            print({
+                "status": "success",
+                "token": new_uuid,
+                "expired_time": expired_time,
+            })
             return {
                 "status": "success",
                 "token": new_uuid,
                 "expired_time": expired_time,
             }
+    print({"status": "fail"})
     return {"status": "fail"}
 
 
@@ -240,11 +249,16 @@ def execute():
     - sync: 阻塞直到 Lambda 返回，返回结果
     - async: 后台线程执行，立刻返回 {"status": "success"}
     """
+    print(request_data)
     request_data = request.get_json()
     token = request_data["token"]
     eventType = request_data["eventType"]
     try:
         if not pass_token_map.get(token):
+            print({
+                "status": "fail",
+                "message": "You do not get the token to run this function",
+            })
             return {
                 "status": "fail",
                 "message": "You do not get the token to run this function",
@@ -252,6 +266,10 @@ def execute():
 
         backend = get_backend_for_token(token)
         if backend is None:
+            print({
+                "status": "fail",
+                "message": "No backend associated with this token",
+            })
             return {
                 "status": "fail",
                 "message": "No backend associated with this token",
@@ -261,9 +279,11 @@ def execute():
 
         if eventType == "sync":
             with backend.lock:
+                print("routing to url: " + backend.url)
                 response = requests.post(backend.url, json=data)
             result = response.json()
             cleanup_token(token)
+            print(result)
             return result
 
         # async
@@ -273,11 +293,13 @@ def execute():
             daemon=False,
         )
         t.start()
+        print({"status": "success"})
         return {"status": "success"}
     except Exception as e:
         print(e)
         if eventType == "sync":
             cleanup_token(token)
+        print({"status": "success"})
         return {"status": "fail"}
 
 
