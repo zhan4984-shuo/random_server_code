@@ -139,7 +139,8 @@ next_backend_index = 0
 
 
 def terminate_self(instance_id: str):
-    ec2 = boto3.client("ec2")
+    region = get_current_region_from_imds()
+    ec2 = boto3.client("ec2", region_name=region)
     logger.info(
         "[SHUTDOWN] calling terminate_instances on self: %s in %s",
         instance_id,
@@ -837,6 +838,43 @@ def get_public_ip():
     except Exception as e:
         logger.exception("Error getting public IP: %s", e)
         return f"Error getting public IP: {e}"
+    
+import requests
+
+def get_current_region_from_imds(timeout: float = 1.0) -> str:
+    """
+    使用 EC2 Instance Metadata Service (IMDSv2) 获取当前实例所在的 AWS Region。
+    只在 EC2 上可用。
+
+    :param timeout: 每次 HTTP 请求的超时时间（秒）
+    :return: 形如 'us-west-2' 的 region 字符串
+    :raises RuntimeError: 如果无法从 IMDS 取到 region
+    """
+    try:
+        # 1) 获取 IMDSv2 token（等价于 shell 的第一条 curl）
+        token = requests.put(
+            "http://169.254.169.254/latest/api/token",
+            headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"},
+            timeout=timeout,
+        ).text
+
+        # 2) 用 token 去拿 instance-identity document（等价于第二条 curl）
+        resp = requests.get(
+            "http://169.254.169.254/latest/dynamic/instance-identity/document",
+            headers={"X-aws-ec2-metadata-token": token},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        doc = resp.json()
+
+        region = doc.get("region")
+        if not region:
+            raise RuntimeError(f"No 'region' field in identity document: {doc}")
+        return region
+
+    except Exception as e:
+        raise RuntimeError(f"Unable to determine region from IMDS: {e}")
+
 
 
 # ─────────────────────────────────────────
