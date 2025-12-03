@@ -80,6 +80,17 @@ capacity: AtomicInteger  # 在 main 里初始化
 next_backend_index = 0
 
 
+def terminate_self(instance_id: str):
+    region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+    if not region:
+        print("[SHUTDOWN] no region in env, skip terminate_self")
+        return
+
+    ec2 = boto3.client("ec2", region_name=region)
+    print(f"[SHUTDOWN] calling terminate_instances on self: {instance_id} in {region}")
+    ec2.terminate_instances(InstanceIds=[instance_id])
+
+
 def assign_backend_for_token(token: str) -> BackendSlot:
     """
     为一个 token 选一个 backend（round-robin）：
@@ -429,20 +440,70 @@ def begin_shutdown():
     - 把全局 is_shutting_down 设为 True
     - 之后所有 /rlb/reserve /rlb/execute /rlb/execute_without_reserve
       都会直接返回 {"status": "shutting-down"}
+
+    额外：
+    - 如果 total_capacity == current_capacity（说明没有在跑的请求）
+      -> 在 active 表里把 status 记成 'terminated'
+      -> 在 history 表里写 terminated_timestamp
+      -> 直接调用 EC2 terminate 自己
     """
-    global is_shutting_down
+    global is_shutting_down, total_capacity, capacity
 
     instance_id = get_instance_id()
+
+    # 1. 标记为 shutting-down + 记录 shutdown_time
     update_shutting_down_instance_status(instance_id)
     update_shutdown_time(instance_id)
 
     is_shutting_down = True
     print("[SHUTDOWN] instance is entering shutting-down state")
-    return {
-        "status": "ok",
-        "is_shutting_down": True,
-    }
 
+    # 2. 用现成的 total_capacity / current_capacity 做一次检查
+    print(
+        f"[SHUTDOWN] capacity check: "
+        f"total_capacity={total_capacity}, current_capacity={capacity.get_value()}"
+    )
+
+    will_terminate_now = False
+
+    if total_capacity == capacity.get_value():
+        # 说明已经没在跑的活了，可以直接认为“空闲可删”
+        will_terminate_now = True
+        print("[SHUTDOWN] no inflight work; marking terminated & terminating self")
+
+        ddb = boto3.resource("dynamodb", region_name="ca-west-1")
+
+        # 2.1 更新 active 表里的状态 -> terminated
+        active_table = ddb.Table("localibou_active_global_vms_table")
+        active_table.update_item(
+            Key={"key": instance_id},
+            UpdateExpression="SET #s = :terminated",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={":terminated": "terminated"},
+        )
+
+        # 2.2 在 history 表里写 terminated_timestamp（你说不要 final_status，就只写时间）
+        history_table = ddb.Table("localibou_ec2_status_history_log")
+        ms = time.time_ns() // 1_000_000
+        history_table.update_item(
+            Key={"ec2_id": instance_id},
+            UpdateExpression="SET terminated_timestamp = :ts",
+            ExpressionAttributeValues={":ts": ms},
+        )
+
+        # 2.3 调用 EC2 terminate self
+        terminate_self(instance_id)  # 下面给一个简单实现
+
+    else:
+        print("[SHUTDOWN] still have inflight work, stay in shutting-down")
+
+    return {
+            "status": "ok",
+            "is_shutting_down": True,
+            "total_capacity": total_capacity,
+            "current_capacity": capacity.get_value(),
+            "will_terminate_now": will_terminate_now,
+        }
 
 # ─────────────────────────────────────────
 # DynamoDB / 实例状态相关逻辑
