@@ -21,7 +21,63 @@ import boto3
 import requests
 from flask import Flask, request
 import threading
+import logging
+from logging.handlers import RotatingFileHandler
 
+
+# ─────────────────────────────────────────
+# Logging setup
+# ─────────────────────────────────────────
+
+def setup_logging():
+    """
+    初始化 logging:
+    - 优先写到 /var/log/random_server.log
+    - 如果失败则写到 /tmp/random_server.log
+    - 再失败就退回 stdout
+    """
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+
+    formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s - %(message)s"
+    )
+
+    log_paths = [
+        "/var/log/random_server_print.log",
+    ]
+
+    handler = None
+    for path in log_paths:
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            handler = RotatingFileHandler(
+                path,
+                maxBytes=10 * 1024 * 1024,  # 10 MB
+                backupCount=5,
+            )
+            break
+        except Exception as e:
+            # 不能写这个 path，尝试下一个
+            # 这里不能用 logger（还没完全配置），直接用 basicConfig 输出一下
+            logging.basicConfig(level=logging.INFO)
+            logging.getLogger(__name__).warning(
+                "Failed to init file handler at %s: %s", path, e
+            )
+
+    if handler is None:
+        # 全部失败，退回 stdout
+        handler = logging.StreamHandler(sys.stdout)
+
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+    # 降低 werkzeug 的噪音（但还保留基本 info）
+    logging.getLogger("werkzeug").setLevel(logging.INFO)
+
+
+setup_logging()
+logger = logging.getLogger(__name__)
 
 
 app = Flask(__name__)
@@ -85,11 +141,15 @@ next_backend_index = 0
 def terminate_self(instance_id: str):
     region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
     if not region:
-        print("[SHUTDOWN] no region in env, skip terminate_self")
+        logger.warning("[SHUTDOWN] no region in env, skip terminate_self")
         return
 
     ec2 = boto3.client("ec2", region_name=region)
-    print(f"[SHUTDOWN] calling terminate_instances on self: {instance_id} in {region}")
+    logger.info(
+        "[SHUTDOWN] calling terminate_instances on self: %s in %s",
+        instance_id,
+        region,
+    )
     ec2.terminate_instances(InstanceIds=[instance_id])
 
 
@@ -104,6 +164,7 @@ def assign_backend_for_token(token: str) -> BackendSlot:
     with token_backend_lock:
         n = len(backends)
         if n == 0:
+            logger.error("No backends available when assigning token %s", token)
             return None
 
         start = next_backend_index
@@ -115,9 +176,16 @@ def assign_backend_for_token(token: str) -> BackendSlot:
                 token_backend_map[token] = idx
                 # 下次从这个 backend 的下一个开始
                 next_backend_index = (idx + 1) % n
+                logger.debug(
+                    "Assigned backend index %d to token %s (url=%s)",
+                    idx,
+                    token,
+                    backend.url,
+                )
                 return backend
 
         # 没有空闲 backend
+        logger.info("All backends busy when assigning token %s", token)
         return None
 
 
@@ -126,6 +194,7 @@ def get_backend_for_token(token: str) -> BackendSlot:
     with token_backend_lock:
         idx = token_backend_map.get(token)
     if idx is None or not (0 <= idx < len(backends)):
+        logger.warning("No backend found for token %s", token)
         return None
     return backends[idx]
 
@@ -136,6 +205,7 @@ def release_backend_for_token(token: str) -> None:
         idx = token_backend_map.pop(token, None)
     if idx is not None and 0 <= idx < len(backends):
         backends[idx].busy = False
+        logger.debug("Released backend index %d for token %s", idx, token)
 
 
 class TimeoutCache:
@@ -160,6 +230,7 @@ class TimeoutCache:
             if now > expiry:
                 # 过期了，只在这里删除，不在这里还 capacity
                 self.store.pop(key, None)
+                logger.info("Token %s expired (TimeoutCache.get)", key)
                 return False
             return True
 
@@ -168,6 +239,7 @@ class TimeoutCache:
         expiry = now + float(ttl)
         with self._lock:
             self.store[key] = expiry
+        logger.debug("Token %s put with ttl=%s, expiry=%s", key, ttl, expiry)
         return expiry
 
     def remove(self, key) -> bool:
@@ -176,6 +248,7 @@ class TimeoutCache:
             existed = key in self.store
             if existed:
                 self.store.pop(key, None)
+                logger.debug("Token %s removed from TimeoutCache", key)
             return existed
 
     def clear(self):
@@ -195,6 +268,7 @@ class TimeoutCache:
 
         # 在锁外做释放
         for key in expired_keys:
+            logger.info("Token %s expired (TimeoutCache.clear)", key)
             capacity.increment()
             release_backend_for_token(key)
 
@@ -226,6 +300,10 @@ def try_shutdown_if_idle():
     # 4. 先更新 DynamoDB，再 terminate 实例
     try:
         instance_id = get_instance_id()
+        logger.info(
+            "[SHUTDOWN] all capacity free for instance %s, updating status to terminated",
+            instance_id,
+        )
 
         # 写 terminated_time + status = terminated
         update_terminated_time(instance_id)
@@ -236,11 +314,11 @@ def try_shutdown_if_idle():
             or os.environ.get("AWS_DEFAULT_REGION")
             or "ca-west-1"
         )
-        print(f"[SHUTDOWN] Terminating instance {instance_id} in region {region}")
+        logger.info("[SHUTDOWN] Terminating instance %s in region %s", instance_id, region)
         ec2 = boto3.client("ec2", region_name=region)
         ec2.terminate_instances(InstanceIds=[instance_id])
     except Exception as e:
-        print(f"[SHUTDOWN] Error when terminating instance: {e}")
+        logger.exception("[SHUTDOWN] Error when terminating instance: %s", e)
 
 
 def cleanup_token(token: str):
@@ -253,7 +331,10 @@ def cleanup_token(token: str):
     """
     removed = pass_token_map.remove(token)
     if removed:
-        capacity.increment()
+        new_cap = capacity.increment()
+        logger.debug(
+            "Cleanup token %s: capacity incremented to %s", token, new_cap
+        )
         release_backend_for_token(token)
         try_shutdown_if_idle()
 
@@ -275,10 +356,15 @@ def pre_occupy():
     pass_token_map.clear()
     ttl = int(request_data["reserve_timeout_sec"])
 
-    if capacity.get_value() > 0:
+    current_cap = capacity.get_value()
+    if current_cap > 0:
         remaining = capacity.decrement()
         if remaining < 0:
             capacity.increment()
+            logger.warning(
+                "[RESERVE] capacity negative after decrement, rollback. current=%s",
+                current_cap,
+            )
             return {"status": "fail"}
         else:
             new_uuid = str(uuid.uuid4())
@@ -287,14 +373,28 @@ def pre_occupy():
             if backend is None:
                 # backend 不够，回滚 capacity
                 capacity.increment()
+                logger.warning(
+                    "[RESERVE] no backend available, rollback capacity. token=%s",
+                    new_uuid,
+                )
                 return {"status": "fail"}
 
             expired_time = pass_token_map.put(new_uuid, ttl)
+            logger.info(
+                "[RESERVE] success token=%s, ttl=%s, expiry=%s, remaining_capacity=%s",
+                new_uuid,
+                ttl,
+                expired_time,
+                remaining,
+            )
             return {
                 "status": "success",
                 "token": new_uuid,
                 "expired_time": expired_time,
             }
+    logger.info(
+        "[RESERVE] no capacity available, current_capacity=%s", current_cap
+    )
     return {"status": "fail"}
 
 
@@ -312,10 +412,9 @@ def execute():
     eventType = request_data["eventType"]
     try:
         if not pass_token_map.get(token):
-            print({
-                "status": "fail",
-                "message": "You do not get the token to run this function",
-            })
+            logger.warning(
+                "[EXECUTE] invalid or expired token=%s", token
+            )
             return {
                 "status": "fail",
                 "message": "You do not get the token to run this function",
@@ -323,10 +422,9 @@ def execute():
 
         backend = get_backend_for_token(token)
         if backend is None:
-            print({
-                "status": "fail",
-                "message": "No backend associated with this token",
-            })
+            logger.warning(
+                "[EXECUTE] no backend associated with token=%s", token
+            )
             return {
                 "status": "fail",
                 "message": "No backend associated with this token",
@@ -336,7 +434,11 @@ def execute():
 
         if eventType == "sync":
             with backend.lock:
-                print("routing to url: " + backend.url)
+                logger.info(
+                    "[EXECUTE] sync request routing to url: %s (token=%s)",
+                    backend.url,
+                    token,
+                )
                 response = requests.post(backend.url, json=data)
             result = response.json()
             cleanup_token(token)
@@ -349,9 +451,10 @@ def execute():
             daemon=False,
         )
         t.start()
+        logger.info("[EXECUTE] async request accepted for token=%s", token)
         return {"status": "success"}
     except Exception as e:
-        print(e)
+        logger.exception("[EXECUTE] error with token=%s: %s", token, e)
         if eventType == "sync":
             cleanup_token(token)
         return {"status": "fail"}
@@ -367,12 +470,20 @@ def post_and_return(token, data):
     try:
         backend = get_backend_for_token(token)
         if backend is None:
+            logger.warning(
+                "[ASYNC] no backend found for token=%s in post_and_return", token
+            )
             return
         with backend.lock:
+            logger.info(
+                "[ASYNC] routing async request to url: %s (token=%s)",
+                backend.url,
+                token,
+            )
             response = requests.post(backend.url, json=data)
         _ = response.json()
     except Exception as e:
-        print(e)
+        logger.exception("[ASYNC] error for token=%s: %s", token, e)
     finally:
         cleanup_token(token)
 
@@ -388,14 +499,17 @@ def execute_without_reserve():
     new_uuid = None
     try:
         request_data = request.get_json()
-        print(request_data)
+        logger.info("[EXECUTE_NO_RESERVE] request_data=%s", request_data)
         eventType = request_data["eventType"]
         pass_token_map.clear()
         current_capacity = capacity.get_value()
         if current_capacity > 0:
             remaining = capacity.decrement()
             if remaining < 0:
-                print("no remaining capacity when decr " + str(remaining))
+                logger.warning(
+                    "[EXECUTE_NO_RESERVE] no remaining capacity when decr, remaining=%s",
+                    remaining,
+                )
                 capacity.increment()
                 return {"status": "fail"}
             else:
@@ -404,6 +518,9 @@ def execute_without_reserve():
                 backend = assign_backend_for_token(new_uuid)
                 if backend is None:
                     capacity.increment()
+                    logger.warning(
+                        "[EXECUTE_NO_RESERVE] no backend available, rollback capacity"
+                    )
                     return {"status": "fail"}
 
                 # 固定 TTL=2 秒，保持你原来的逻辑
@@ -412,6 +529,11 @@ def execute_without_reserve():
 
                 if eventType == "sync":
                     with backend.lock:
+                        logger.info(
+                            "[EXECUTE_NO_RESERVE] sync routing to url=%s (token=%s)",
+                            backend.url,
+                            new_uuid,
+                        )
                         response = requests.post(backend.url, json=data)
                     result = response.json()
                     cleanup_token(new_uuid)
@@ -423,11 +545,17 @@ def execute_without_reserve():
                         daemon=False,
                     )
                     t.start()
+                    logger.info(
+                        "[EXECUTE_NO_RESERVE] async accepted (token=%s)", new_uuid
+                    )
                     return {"status": "success"}
-        print("no remaining capacity when check " + str(current_capacity))
+        logger.info(
+            "[EXECUTE_NO_RESERVE] no remaining capacity when check, current=%s",
+            current_capacity,
+        )
         return {"status": "fail"}
     except Exception as e:
-        print(e)
+        logger.exception("[EXECUTE_NO_RESERVE] error: %s", e)
         if new_uuid is not None:
             cleanup_token(new_uuid)
         return {"status": "fail"}
@@ -458,20 +586,24 @@ def begin_shutdown():
     update_shutdown_time(instance_id)
 
     is_shutting_down = True
-    print("[SHUTDOWN] instance is entering shutting-down state")
+    logger.info("[SHUTDOWN] instance %s is entering shutting-down state", instance_id)
 
     # 2. 用现成的 total_capacity / current_capacity 做一次检查
-    print(
-        f"[SHUTDOWN] capacity check: "
-        f"total_capacity={total_capacity}, current_capacity={capacity.get_value()}"
+    current_cap = capacity.get_value()
+    logger.info(
+        "[SHUTDOWN] capacity check: total_capacity=%s, current_capacity=%s",
+        total_capacity,
+        current_cap,
     )
 
     will_terminate_now = False
 
-    if total_capacity == capacity.get_value():
+    if total_capacity == current_cap:
         # 说明已经没在跑的活了，可以直接认为“空闲可删”
         will_terminate_now = True
-        print("[SHUTDOWN] no inflight work; marking terminated & terminating self")
+        logger.info(
+            "[SHUTDOWN] no inflight work; marking terminated & terminating self"
+        )
 
         ddb = boto3.resource("dynamodb", region_name="ca-west-1")
 
@@ -484,7 +616,7 @@ def begin_shutdown():
             ExpressionAttributeValues={":terminated": "terminated"},
         )
 
-        # 2.2 在 history 表里写 terminated_timestamp（你说不要 final_status，就只写时间）
+        # 2.2 在 history 表里写 terminated_timestamp
         history_table = ddb.Table("localibou_ec2_status_history_log")
         ms = time.time_ns() // 1_000_000
         history_table.update_item(
@@ -494,18 +626,23 @@ def begin_shutdown():
         )
 
         # 2.3 调用 EC2 terminate self
-        terminate_self(instance_id)  # 下面给一个简单实现
+        terminate_self(instance_id)
 
     else:
-        print("[SHUTDOWN] still have inflight work, stay in shutting-down")
+        logger.info(
+            "[SHUTDOWN] still have inflight work, stay in shutting-down (total=%s, current=%s)",
+            total_capacity,
+            current_cap,
+        )
 
     return {
-            "status": "ok",
-            "is_shutting_down": True,
-            "total_capacity": total_capacity,
-            "current_capacity": capacity.get_value(),
-            "will_terminate_now": will_terminate_now,
-        }
+        "status": "ok",
+        "is_shutting_down": True,
+        "total_capacity": total_capacity,
+        "current_capacity": current_cap,
+        "will_terminate_now": will_terminate_now,
+    }
+
 
 # ─────────────────────────────────────────
 # DynamoDB / 实例状态相关逻辑
@@ -530,6 +667,9 @@ def updateInstanceStatus(instance_id, local_ip):
         },
         ReturnValues="ALL_NEW",
     )
+    logger.info(
+        "[STATUS] instance %s moved to 'running' with public_ip=%s", instance_id, local_ip
+    )
     return response
 
 
@@ -548,10 +688,17 @@ def update_shutting_down_instance_status(instance_id):
             ExpressionAttributeValues={":sd": "shutting-down"},
             ReturnValues="UPDATED_NEW",
         )
-        print(f"[SHUTDOWN] Updated DynamoDB status to 'shutting-down' for {instance_id}")
+        logger.info(
+            "[SHUTDOWN] Updated DynamoDB status to 'shutting-down' for %s",
+            instance_id,
+        )
         return response
     except Exception as e:
-        print(f"[SHUTDOWN] Failed to update shutting-down status in DynamoDB: {e}")
+        logger.exception(
+            "[SHUTDOWN] Failed to update shutting-down status in DynamoDB for %s: %s",
+            instance_id,
+            e,
+        )
         return None
 
 
@@ -570,11 +717,17 @@ def update_terminated_instance_status(instance_id):
             ExpressionAttributeValues={":terminated": "terminated"},
             ReturnValues="UPDATED_NEW",
         )
-        print(f"[SHUTDOWN] Updated DynamoDB status to 'terminated' for {instance_id}")
+        logger.info(
+            "[SHUTDOWN] Updated DynamoDB status to 'terminated' for %s", instance_id
+        )
         return response
     except Exception as e:
         # 打 log，但不要阻止真正的 terminate
-        print(f"[SHUTDOWN] Failed to update terminated status in DynamoDB: {e}")
+        logger.exception(
+            "[SHUTDOWN] Failed to update terminated status in DynamoDB for %s: %s",
+            instance_id,
+            e,
+        )
         return None
 
 
@@ -591,9 +744,14 @@ def update_running_new_machine_history(instance_id):
             UpdateExpression="SET running_time = :t",
             ExpressionAttributeValues={":t": ms},
         )
+        logger.info(
+            "[HISTORY] Recorded running_time for instance %s: %s", instance_id, ms
+        )
         return response
     except Exception as e:
-        print(e)
+        logger.exception(
+            "[HISTORY] Failed to record running_time for %s: %s", instance_id, e
+        )
         return None
 
 
@@ -610,10 +768,14 @@ def update_shutdown_time(instance_id):
             UpdateExpression="SET shutdown_time = :t",
             ExpressionAttributeValues={":t": ms},
         )
-        print(f"[SHUTDOWN] Recorded shutdown_time for {instance_id}")
+        logger.info(
+            "[HISTORY] Recorded shutdown_time for %s: %s", instance_id, ms
+        )
         return response
     except Exception as e:
-        print(f"[SHUTDOWN] Failed to record shutdown_time: {e}")
+        logger.exception(
+            "[HISTORY] Failed to record shutdown_time for %s: %s", instance_id, e
+        )
         return None
 
 
@@ -630,10 +792,14 @@ def update_terminated_time(instance_id):
             UpdateExpression="SET terminated_time = :t",
             ExpressionAttributeValues={":t": ms},
         )
-        print(f"[SHUTDOWN] Recorded terminated_time for {instance_id}")
+        logger.info(
+            "[HISTORY] Recorded terminated_time for %s: %s", instance_id, ms
+        )
         return response
     except Exception as e:
-        print(f"[SHUTDOWN] Failed to record terminated_time: {e}")
+        logger.exception(
+            "[HISTORY] Failed to record terminated_time for %s: %s", instance_id, e
+        )
         return None
 
 
@@ -654,6 +820,7 @@ def get_instance_id():
         return instance_id
 
     except Exception as e:
+        logger.exception("Error getting instance ID: %s", e)
         return f"Error getting instance ID: {e}"
 
 
@@ -673,6 +840,7 @@ def get_public_ip():
 
         return public_ip
     except Exception as e:
+        logger.exception("Error getting public IP: %s", e)
         return f"Error getting public IP: {e}"
 
 
@@ -705,14 +873,20 @@ if __name__ == "__main__":
 
     port = int(os.environ.get("PORT", 9000))
     instance_id = get_instance_id()
-    print("instance_id:", instance_id)
+    logger.info("instance_id: %s", instance_id)
     local_ip = get_public_ip()
-    print("public_ip:", local_ip)
+    logger.info("public_ip: %s", local_ip)
     res = updateInstanceStatus(instance_id, local_ip)
     if res is not None:
         attrs = res["Attributes"]
         region = attrs["region"]
         workflow_id = attrs["workflow_id"]
         update_running_new_machine_history(instance_id)
-    print(res)
+    logger.info("updateInstanceStatus response: %s", res)
+    logger.info(
+        "random_server starting on 0.0.0.0:%s with capacity=%s, backends=%s",
+        port,
+        capacity_value,
+        [b.url for b in backends],
+    )
     app.run(host="0.0.0.0", port=port)
