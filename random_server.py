@@ -139,12 +139,7 @@ next_backend_index = 0
 
 
 def terminate_self(instance_id: str):
-    region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
-    if not region:
-        logger.warning("[SHUTDOWN] no region in env, skip terminate_self")
-        return
-
-    ec2 = boto3.client("ec2", region_name=region)
+    ec2 = boto3.client("ec2")
     logger.info(
         "[SHUTDOWN] calling terminate_instances on self: %s in %s",
         instance_id,
