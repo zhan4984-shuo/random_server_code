@@ -26,6 +26,13 @@ app = Flask(__name__)
 container_uuid = str(uuid.uuid4())
 request_count = 0
 
+# ====== 关机相关全局变量 ======
+is_shutting_down = False          # 是否进入 shutdown 状态
+total_capacity = 0                # 初始总 capacity（在 main 里赋值）
+shutdown_lock = threading.Lock()  # 防止多线程重复 terminate
+termination_started = False       # 只允许 terminate_instances 调用一次
+# ============================
+
 # ─────────────────────────────────────────
 # 基础并发原语
 # ─────────────────────────────────────────
@@ -182,17 +189,60 @@ class TimeoutCache:
 pass_token_map: TimeoutCache  # 在 main 里初始化
 
 
+def try_shutdown_if_idle():
+    """
+    如果已经进入 shutdown 且所有 capacity 都空闲，
+    先更新 DynamoDB 为 terminated，然后调用 EC2 API 终止当前实例。
+    """
+    global termination_started
+
+    # 1. 还没进入 shutdown，直接返回
+    if not is_shutting_down:
+        return
+
+    # 2. 还有容量在用，不能关机
+    if capacity.get_value() != total_capacity:
+        return
+
+    # 3. 防止多线程重复终止
+    with shutdown_lock:
+        if termination_started:
+            return
+        termination_started = True
+
+    # 4. 先更新 DynamoDB，再 terminate 实例
+    try:
+        instance_id = get_instance_id()
+
+        # 写 terminated_time + status = terminated
+        update_terminated_time(instance_id)
+        update_terminated_instance_status(instance_id)
+
+        region = (
+            os.environ.get("AWS_REGION")
+            or os.environ.get("AWS_DEFAULT_REGION")
+            or "ca-west-1"
+        )
+        print(f"[SHUTDOWN] Terminating instance {instance_id} in region {region}")
+        ec2 = boto3.client("ec2", region_name=region)
+        ec2.terminate_instances(InstanceIds=[instance_id])
+    except Exception as e:
+        print(f"[SHUTDOWN] Error when terminating instance: {e}")
+
+
 def cleanup_token(token: str):
     """
     统一 token 清理逻辑：
     - 从 TimeoutCache 删除
     - capacity +1
     - 释放 backend
+    - 如果 shutdown 且空闲，则尝试关机
     """
     removed = pass_token_map.remove(token)
     if removed:
         capacity.increment()
         release_backend_for_token(token)
+        try_shutdown_if_idle()
 
 
 # ─────────────────────────────────────────
@@ -201,13 +251,14 @@ def cleanup_token(token: str):
 
 @app.route("/rlb/reserve", methods=["POST"])
 def pre_occupy():
+    if is_shutting_down:
+        return {"status": "shutting-down"}
     """
     预留一个执行 slot：
     - 如果有空闲 capacity + backend，就返回 token
     - 否则返回 fail
     """
     request_data = request.get_json()
-    print(request_data)
     pass_token_map.clear()
     ttl = int(request_data["reserve_timeout_sec"])
 
@@ -215,7 +266,6 @@ def pre_occupy():
         remaining = capacity.decrement()
         if remaining < 0:
             capacity.increment()
-            print({"status": "fail"})
             return {"status": "fail"}
         else:
             new_uuid = str(uuid.uuid4())
@@ -224,33 +274,27 @@ def pre_occupy():
             if backend is None:
                 # backend 不够，回滚 capacity
                 capacity.increment()
-                print({"status": "fail"})
                 return {"status": "fail"}
 
             expired_time = pass_token_map.put(new_uuid, ttl)
-            print({
-                "status": "success",
-                "token": new_uuid,
-                "expired_time": expired_time,
-            })
             return {
                 "status": "success",
                 "token": new_uuid,
                 "expired_time": expired_time,
             }
-    print({"status": "fail"})
     return {"status": "fail"}
 
 
 @app.route("/rlb/execute", methods=["POST"])
 def execute():
+    if is_shutting_down:
+        return {"status": "shutting-down"}
     """
     使用预留的 token 执行：
     - sync: 阻塞直到 Lambda 返回，返回结果
     - async: 后台线程执行，立刻返回 {"status": "success"}
     """
     request_data = request.get_json()
-    print(request_data)
     token = request_data["token"]
     eventType = request_data["eventType"]
     try:
@@ -283,7 +327,6 @@ def execute():
                 response = requests.post(backend.url, json=data)
             result = response.json()
             cleanup_token(token)
-            print(result)
             return result
 
         # async
@@ -293,13 +336,11 @@ def execute():
             daemon=False,
         )
         t.start()
-        print({"status": "success"})
         return {"status": "success"}
     except Exception as e:
         print(e)
         if eventType == "sync":
             cleanup_token(token)
-        print({"status": "success"})
         return {"status": "fail"}
 
 
@@ -325,6 +366,8 @@ def post_and_return(token, data):
 
 @app.route("/rlb/execute_without_reserve", methods=["POST"])
 def execute_without_reserve():
+    if is_shutting_down:
+        return {"status": "shutting-down"}
     """
     不经过预留，直接抢占一个 slot 执行：
     - 成功时内部也生成一个 token，绑定 backend，用完后释放
@@ -377,11 +420,38 @@ def execute_without_reserve():
         return {"status": "fail"}
 
 
+@app.route("/rlb/begin_shutdown", methods=["POST"])
+def begin_shutdown():
+    """
+    标记当前实例进入关机状态：
+    - 更新 DynamoDB status 为 'shutting-down'
+    - 在 history 表里记录 shutdown_time
+    - 把全局 is_shutting_down 设为 True
+    - 之后所有 /rlb/reserve /rlb/execute /rlb/execute_without_reserve
+      都会直接返回 {"status": "shutting-down"}
+    """
+    global is_shutting_down
+
+    instance_id = get_instance_id()
+    update_shutting_down_instance_status(instance_id)
+    update_shutdown_time(instance_id)
+
+    is_shutting_down = True
+    print("[SHUTDOWN] instance is entering shutting-down state")
+    return {
+        "status": "ok",
+        "is_shutting_down": True,
+    }
+
+
 # ─────────────────────────────────────────
 # DynamoDB / 实例状态相关逻辑
 # ─────────────────────────────────────────
 
 def updateInstanceStatus(instance_id, local_ip):
+    """
+    启动时：从 init -> running，同时写入 public_ip
+    """
     dynamodb = boto3.resource("dynamodb", region_name="ca-west-1")
     decision_table = dynamodb.Table("localibou_active_global_vms_table")
 
@@ -400,7 +470,55 @@ def updateInstanceStatus(instance_id, local_ip):
     return response
 
 
+def update_shutting_down_instance_status(instance_id):
+    """
+    进入 shutting-down 阶段时：status = 'shutting-down'
+    """
+    try:
+        dynamodb = boto3.resource("dynamodb", region_name="ca-west-1")
+        decision_table = dynamodb.Table("localibou_active_global_vms_table")
+
+        response = decision_table.update_item(
+            Key={"key": instance_id},
+            UpdateExpression="SET #s = :sd",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={":sd": "shutting-down"},
+            ReturnValues="UPDATED_NEW",
+        )
+        print(f"[SHUTDOWN] Updated DynamoDB status to 'shutting-down' for {instance_id}")
+        return response
+    except Exception as e:
+        print(f"[SHUTDOWN] Failed to update shutting-down status in DynamoDB: {e}")
+        return None
+
+
+def update_terminated_instance_status(instance_id):
+    """
+    即将 terminate 前：status = 'terminated'
+    """
+    try:
+        dynamodb = boto3.resource("dynamodb", region_name="ca-west-1")
+        decision_table = dynamodb.Table("localibou_active_global_vms_table")
+
+        response = decision_table.update_item(
+            Key={"key": instance_id},
+            UpdateExpression="SET #s = :terminated",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={":terminated": "terminated"},
+            ReturnValues="UPDATED_NEW",
+        )
+        print(f"[SHUTDOWN] Updated DynamoDB status to 'terminated' for {instance_id}")
+        return response
+    except Exception as e:
+        # 打 log，但不要阻止真正的 terminate
+        print(f"[SHUTDOWN] Failed to update terminated status in DynamoDB: {e}")
+        return None
+
+
 def update_running_new_machine_history(instance_id):
+    """
+    在 history 表里记录 running_time（毫秒时间戳）
+    """
     ms = time.time_ns() // 1_000_000
     try:
         dynamodb = boto3.resource("dynamodb", region_name="ca-west-1")
@@ -413,6 +531,46 @@ def update_running_new_machine_history(instance_id):
         return response
     except Exception as e:
         print(e)
+        return None
+
+
+def update_shutdown_time(instance_id):
+    """
+    在 history 表里记录 shutdown_time（毫秒时间戳）
+    """
+    ms = time.time_ns() // 1_000_000
+    try:
+        dynamodb = boto3.resource("dynamodb", region_name="ca-west-1")
+        table = dynamodb.Table("localibou_ec2_status_history_log")
+        response = table.update_item(
+            Key={"ec2_id": instance_id},
+            UpdateExpression="SET shutdown_time = :t",
+            ExpressionAttributeValues={":t": ms},
+        )
+        print(f"[SHUTDOWN] Recorded shutdown_time for {instance_id}")
+        return response
+    except Exception as e:
+        print(f"[SHUTDOWN] Failed to record shutdown_time: {e}")
+        return None
+
+
+def update_terminated_time(instance_id):
+    """
+    在 history 表里记录 terminated_time（毫秒时间戳）
+    """
+    ms = time.time_ns() // 1_000_000
+    try:
+        dynamodb = boto3.resource("dynamodb", region_name="ca-west-1")
+        table = dynamodb.Table("localibou_ec2_status_history_log")
+        response = table.update_item(
+            Key={"ec2_id": instance_id},
+            UpdateExpression="SET terminated_time = :t",
+            ExpressionAttributeValues={":t": ms},
+        )
+        print(f"[SHUTDOWN] Recorded terminated_time for {instance_id}")
+        return response
+    except Exception as e:
+        print(f"[SHUTDOWN] Failed to record terminated_time: {e}")
         return None
 
 
@@ -466,6 +624,11 @@ if __name__ == "__main__":
     capacity_value = int(sys.argv[1])  # capacity = 容器数（replicas）
     capacity = AtomicInteger(capacity_value)
     pass_token_map = TimeoutCache()
+
+    # 初始状态不在 shutdown
+    is_shutting_down = False
+    # 记录总 capacity，用于判断“是否完全空闲”
+    total_capacity = capacity_value
 
     # BACKEND_BASE_PORT: 第一个容器的 host 端口，默认 8080
     base_port = int(os.environ.get("BACKEND_BASE_PORT", "8080"))
