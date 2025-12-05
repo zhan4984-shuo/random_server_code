@@ -23,7 +23,12 @@ from flask import Flask, request
 import threading
 import logging
 from logging.handlers import RotatingFileHandler
+from typing import Tuple
 
+
+RESERVE = "Reserve_count"
+EXECUTE = "Execute_count"
+EXECUTE_NO_RESERVE = "Execute_no_reserve_count"
 
 # ─────────────────────────────────────────
 # Logging setup
@@ -133,6 +138,8 @@ backends: List[BackendSlot] = []
 token_backend_map: Dict[str, int] = {}
 token_backend_lock = threading.Lock()
 capacity: AtomicInteger  # 在 main 里初始化
+num_of_req_map = {}
+time_of_exec_map = {}
 
 # round-robin 起点
 next_backend_index = 0
@@ -185,14 +192,14 @@ def assign_backend_for_token(token: str) -> BackendSlot:
         return None
 
 
-def get_backend_for_token(token: str) -> BackendSlot:
+def get_backend_for_token(token: str) -> Tuple[BackendSlot, int]:
     """根据 token 找到对应 backend，如果没有则返回 None。"""
     with token_backend_lock:
         idx = token_backend_map.get(token)
     if idx is None or not (0 <= idx < len(backends)):
         logger.warning("No backend found for token %s", token)
         return None
-    return backends[idx]
+    return backends[idx], idx
 
 
 def release_backend_for_token(token: str) -> None:
@@ -348,6 +355,7 @@ def pre_occupy():
     - 如果有空闲 capacity + backend，就返回 token
     - 否则返回 fail
     """
+    num_of_req_map[RESERVE].increment()
     request_data = request.get_json()
     pass_token_map.clear()
     ttl = int(request_data["reserve_timeout_sec"])
@@ -403,6 +411,7 @@ def execute():
     - sync: 阻塞直到 Lambda 返回，返回结果
     - async: 后台线程执行，立刻返回 {"status": "success"}
     """
+    num_of_req_map[EXECUTE].increment()
     request_data = request.get_json()
     token = request_data["token"]
     eventType = request_data["eventType"]
@@ -416,7 +425,7 @@ def execute():
                 "message": "You do not get the token to run this function",
             }
 
-        backend = get_backend_for_token(token)
+        backend, idx = get_backend_for_token(token)
         if backend is None:
             logger.warning(
                 "[EXECUTE] no backend associated with token=%s", token
@@ -435,7 +444,11 @@ def execute():
                     backend.url,
                     token,
                 )
+                start_execute_time = time.time_ns() // 1_000_000
                 response = requests.post(backend.url, json=data)
+                time_of_exec_map[idx].increment(
+                    (time.time_ns() // 1_000_000) - start_execute_time
+                )
             result = response.json()
             cleanup_token(token)
             return result
@@ -464,7 +477,7 @@ def post_and_return(token, data):
     - 最后 cleanup_token
     """
     try:
-        backend = get_backend_for_token(token)
+        backend, idx = get_backend_for_token(token)
         if backend is None:
             logger.warning(
                 "[ASYNC] no backend found for token=%s in post_and_return", token
@@ -476,7 +489,11 @@ def post_and_return(token, data):
                 backend.url,
                 token,
             )
+            start_execute_time = time.time_ns() // 1_000_000
             response = requests.post(backend.url, json=data)
+            time_of_exec_map[idx].increment(
+                    (time.time_ns() // 1_000_000) - start_execute_time
+            )
         _ = response.json()
     except Exception as e:
         logger.exception("[ASYNC] error for token=%s: %s", token, e)
@@ -492,6 +509,7 @@ def execute_without_reserve():
     不经过预留，直接抢占一个 slot 执行：
     - 成功时内部也生成一个 token，绑定 backend，用完后释放
     """
+    num_of_req_map[EXECUTE_NO_RESERVE].increment()
     new_uuid = None
     try:
         request_data = request.get_json()
@@ -607,9 +625,17 @@ def begin_shutdown():
         active_table = ddb.Table("localibou_active_global_vms_table")
         active_table.update_item(
             Key={"key": instance_id},
-            UpdateExpression="SET #s = :terminated",
+            UpdateExpression=(
+                "SET #s = :terminated, "
+                "exec_time_map = :exec_map, "
+                "req_num_map = :req_map"
+            ),
             ExpressionAttributeNames={"#s": "status"},
-            ExpressionAttributeValues={":terminated": "terminated"},
+            ExpressionAttributeValues={
+                ":terminated": "terminated",
+                ":exec_map": time_of_exec_map,
+                ":req_map": num_of_req_map,
+            },
         )
 
         # 2.2 在 history 表里写 terminated_timestamp
@@ -885,6 +911,7 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         raise SystemExit("Usage: python random_server.py <capacity>")
 
+
     capacity_value = int(sys.argv[1])  # capacity = 容器数（replicas）
     capacity = AtomicInteger(capacity_value)
     pass_token_map = TimeoutCache()
@@ -909,6 +936,18 @@ if __name__ == "__main__":
     logger.info("instance_id: %s", instance_id)
     local_ip = get_public_ip()
     logger.info("public_ip: %s", local_ip)
+    
+    num_of_req_map = {
+        RESERVE: AtomicInteger(0),
+        EXECUTE: AtomicInteger(0),
+        EXECUTE_NO_RESERVE: AtomicInteger(0),
+    }
+    
+    for i in range(total_capacity):
+        time_of_exec_map = {
+            i: AtomicInteger(0),
+        }
+    
     res = updateInstanceStatus(instance_id, local_ip)
     if res is not None:
         attrs = res["Attributes"]
@@ -922,4 +961,4 @@ if __name__ == "__main__":
         capacity_value,
         [b.url for b in backends],
     )
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, threaded=True)
