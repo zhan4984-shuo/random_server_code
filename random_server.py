@@ -620,6 +620,14 @@ def begin_shutdown():
         )
 
         ddb = boto3.resource("dynamodb", region_name="ca-west-1")
+        
+        time_exec_map = {}
+        num_req_map = {}
+        for i in time_of_exec_map.keys():
+            time_exec_map[i] = time_of_exec_map[i].get_value()
+        for i in num_of_req_map.keys():
+            num_req_map[i] = num_of_req_map[i].get_value()
+        
 
         # 2.1 更新 active 表里的状态 -> terminated
         active_table = ddb.Table("localibou_active_global_vms_table")
@@ -633,8 +641,8 @@ def begin_shutdown():
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={
                 ":terminated": "terminated",
-                ":exec_map": time_of_exec_map,
-                ":req_map": num_of_req_map,
+                ":exec_map": str(time_exec_map),
+                ":req_map": str(num_of_req_map),
             },
         )
 
