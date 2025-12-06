@@ -657,7 +657,7 @@ def begin_shutdown():
             ExpressionAttributeValues={
                 ":ts": ms,
                 ":exec_map": str(time_exec_map),
-                ":req_map": str(num_of_req_map),
+                ":req_map": str(num_req_map),
             },
         )
 
