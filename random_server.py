@@ -976,7 +976,7 @@ if __name__ == "__main__":
         time_of_exec_map = {
             i: AtomicInteger(0),
         }
-    print(time_of_exec_map)
+    logger.info(time_of_exec_map)
     
     res = updateInstanceStatus(instance_id, local_ip)
     if res is not None:
