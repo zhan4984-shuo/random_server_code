@@ -15,6 +15,7 @@ import sys
 import uuid
 import time
 import json
+import subprocess
 from typing import List, Dict, Any
 
 import boto3
@@ -143,6 +144,20 @@ time_of_exec_map = {}
 
 # round-robin 起点
 next_backend_index = 0
+
+def get_container_id_by_host_port(port: int) -> str:
+    result = subprocess.run(
+        ["docker", "ps", "--format", "{{.ID}} {{.Ports}}"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=True,
+    )
+    for line in result.stdout.splitlines():
+        cid, ports = line.split(" ", 1)
+        if f":{port}->" in ports:
+            return cid
+    return ""
 
 
 def terminate_self(instance_id: str):
@@ -624,7 +639,7 @@ def begin_shutdown():
         time_exec_map = {}
         num_req_map = {}
         for i in time_of_exec_map.keys():
-            time_exec_map[i] = time_of_exec_map[i].get_value()
+            time_exec_map[get_container_id_by_host_port(8080 + i)] = time_of_exec_map[i].get_value()
         for i in num_of_req_map.keys():
             num_req_map[i] = num_of_req_map[i].get_value()
         
