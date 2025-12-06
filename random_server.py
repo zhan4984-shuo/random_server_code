@@ -3,11 +3,11 @@
 Random server that fronts multiple Lambda containers (RIE) and forwards
 requests to them with capacity + token control.
 
-- 启动方式: python3 random_server.py <capacity>
-    capacity = 本机容器数量（replicas）
-- 需要环境变量:
-    BACKEND_BASE_PORT: 第一个容器映射的 host 端口 (默认 8080)
-    BACKEND_HOST: 容器 host 地址 (默认 localhost)
+- Start: python3 random_server.py <capacity>
+    capacity = number of local containers (replicas)
+- Required environment variables:
+    BACKEND_BASE_PORT: host port mapped to the first container (default 8080)
+    BACKEND_HOST: container host address (default localhost)
 """
 
 import os
@@ -37,10 +37,10 @@ EXECUTE_NO_RESERVE = "Execute_no_reserve_count"
 
 def setup_logging():
     """
-    初始化 logging:
-    - 优先写到 /var/log/random_server.log
-    - 如果失败则写到 /tmp/random_server.log
-    - 再失败就退回 stdout
+    Initialize logging:
+    - Prefer writing to /var/log/random_server.log
+    - If that fails, write to /tmp/random_server.log
+    - If that still fails, fall back to stdout
     """
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
@@ -64,21 +64,21 @@ def setup_logging():
             )
             break
         except Exception as e:
-            # 不能写这个 path，尝试下一个
-            # 这里不能用 logger（还没完全配置），直接用 basicConfig 输出一下
+            # Cannot write to this path, try the next one.
+            # We cannot use the logger yet (not fully configured), so use basicConfig directly.
             logging.basicConfig(level=logging.INFO)
             logging.getLogger(__name__).warning(
                 "Failed to init file handler at %s: %s", path, e
             )
 
     if handler is None:
-        # 全部失败，退回 stdout
+        # All paths failed, fall back to stdout
         handler = logging.StreamHandler(sys.stdout)
 
     handler.setFormatter(formatter)
     logger.addHandler(handler)
 
-    # 降低 werkzeug 的噪音（但还保留基本 info）
+    # Reduce werkzeug noise (but keep basic info)
     logging.getLogger("werkzeug").setLevel(logging.INFO)
 
 
@@ -90,15 +90,15 @@ app = Flask(__name__)
 container_uuid = str(uuid.uuid4())
 request_count = 0
 
-# ====== 关机相关全局变量 ======
-is_shutting_down = False          # 是否进入 shutdown 状态
-total_capacity = 0                # 初始总 capacity（在 main 里赋值）
-shutdown_lock = threading.Lock()  # 防止多线程重复 terminate
-termination_started = False       # 只允许 terminate_instances 调用一次
-# ============================
+# ====== Shutdown-related global variables ======
+is_shutting_down = False          # Whether we have entered shutdown state
+total_capacity = 0                # Initial total capacity (assigned in main)
+shutdown_lock = threading.Lock()  # Prevent multiple threads from terminating twice
+termination_started = False       # Ensure terminate_instances is only called once
+# ==============================================
 
 # ─────────────────────────────────────────
-# 基础并发原语
+# Basic concurrency primitives
 # ─────────────────────────────────────────
 
 class AtomicInteger:
@@ -123,10 +123,10 @@ class AtomicInteger:
 
 class BackendSlot:
     """
-    每个容器对应一个 backend slot：
-    - url: 这个容器的 invocations URL（带 host:port）
-    - lock: 保证该容器单并发
-    - busy: 是否已被某个 token 占用
+    Each container corresponds to one backend slot:
+    - url: this container's invocation URL (with host:port)
+    - lock: ensures single concurrency per container
+    - busy: whether this container is currently occupied by a token
     """
     def __init__(self, url: str):
         self.url = url
@@ -134,15 +134,15 @@ class BackendSlot:
         self.busy = False
 
 
-# 全局：backend 列表 + token -> backend 映射
+# Globals: backend list + token -> backend mapping
 backends: List[BackendSlot] = []
 token_backend_map: Dict[str, int] = {}
 token_backend_lock = threading.Lock()
-capacity: AtomicInteger  # 在 main 里初始化
+capacity: AtomicInteger  # initialized in main
 num_of_req_map = {}
 time_of_exec_map = {}
 
-# round-robin 起点
+# Round-robin starting index
 next_backend_index = 0
 
 def get_container_id_by_host_port(port: int) -> str:
@@ -173,10 +173,10 @@ def terminate_self(instance_id: str):
 
 def assign_backend_for_token(token: str) -> BackendSlot:
     """
-    为一个 token 选一个 backend（round-robin）：
-    - 从 next_backend_index 开始绕一圈
-    - 找到第一个 not busy 的 backend
-    - 标记为 busy，并更新 next_backend_index
+    Choose a backend for a token (round-robin):
+    - Start from next_backend_index and wrap around once
+    - Find the first backend that is not busy
+    - Mark it busy and update next_backend_index
     """
     global next_backend_index
     with token_backend_lock:
@@ -192,7 +192,7 @@ def assign_backend_for_token(token: str) -> BackendSlot:
             if not backend.busy:
                 backend.busy = True
                 token_backend_map[token] = idx
-                # 下次从这个 backend 的下一个开始
+                # Next time, start from the next backend
                 next_backend_index = (idx + 1) % n
                 logger.debug(
                     "Assigned backend index %d to token %s (url=%s)",
@@ -202,13 +202,13 @@ def assign_backend_for_token(token: str) -> BackendSlot:
                 )
                 return backend
 
-        # 没有空闲 backend
+        # No free backend
         logger.info("All backends busy when assigning token %s", token)
         return None
 
 
 def get_backend_for_token(token: str) -> Tuple[BackendSlot, int]:
-    """根据 token 找到对应 backend，如果没有则返回 None。"""
+    """Find the backend and index for a token. If not found, return None."""
     with token_backend_lock:
         idx = token_backend_map.get(token)
     if idx is None or not (0 <= idx < len(backends)):
@@ -218,7 +218,7 @@ def get_backend_for_token(token: str) -> Tuple[BackendSlot, int]:
 
 
 def release_backend_for_token(token: str) -> None:
-    """释放 token 关联的 backend，让它可以重新被使用。"""
+    """Release the backend associated with a token so it can be reused."""
     with token_backend_lock:
         idx = token_backend_map.pop(token, None)
     if idx is not None and 0 <= idx < len(backends):
@@ -228,11 +228,11 @@ def release_backend_for_token(token: str) -> None:
 
 class TimeoutCache:
     """
-    带 TTL 的 token 存储：
-    - get(key): 检查 token 是否还有效（未过期）
-    - put(key, ttl): 写入 token 和过期时间
-    - remove(key) -> bool: 删除 token，返回是否真的存在
-    - clear(): 清理过期 token，并归还 capacity + 释放 backend
+    TTL-based token store:
+    - get(key): check whether token is still valid (not expired)
+    - put(key, ttl): write token with its expiry time
+    - remove(key) -> bool: delete token, return whether it existed (to avoid double free)
+    - clear(): clean expired tokens, return capacity, and release backend
     """
     def __init__(self):
         self.store = {}
@@ -246,7 +246,7 @@ class TimeoutCache:
             if expiry is None:
                 return False
             if now > expiry:
-                # 过期了，只在这里删除，不在这里还 capacity
+                # Expired; delete here but do not restore capacity here
                 self.store.pop(key, None)
                 logger.info("Token %s expired (TimeoutCache.get)", key)
                 return False
@@ -261,7 +261,7 @@ class TimeoutCache:
         return expiry
 
     def remove(self, key) -> bool:
-        """删除 key，返回是否真的存在，用于避免 double free。"""
+        """Delete key and return whether it existed (used to avoid double free)."""
         with self._lock:
             existed = key in self.store
             if existed:
@@ -271,10 +271,10 @@ class TimeoutCache:
 
     def clear(self):
         """
-        清理已过期 token：
-        - 从 store 删除
-        - 归还 capacity
-        - 释放 backend
+        Clean expired tokens:
+        - Remove from store
+        - Return capacity
+        - Release backend
         """
         now = time.time()
         expired_keys = []
@@ -284,38 +284,38 @@ class TimeoutCache:
                     self.store.pop(key, None)
                     expired_keys.append(key)
 
-        # 在锁外做释放
+        # Do capacity/backend release outside the lock
         for key in expired_keys:
             logger.info("Token %s expired (TimeoutCache.clear)", key)
             capacity.increment()
             release_backend_for_token(key)
 
 
-pass_token_map: TimeoutCache  # 在 main 里初始化
+pass_token_map: TimeoutCache  # initialized in main
 
 
 def try_shutdown_if_idle():
     """
-    如果已经进入 shutdown 且所有 capacity 都空闲，
-    先更新 DynamoDB 为 terminated，然后调用 EC2 API 终止当前实例。
+    If we are already in shutdown state and all capacity is free,
+    first update DynamoDB as terminated, then call EC2 API to terminate this instance.
     """
     global termination_started
 
-    # 1. 还没进入 shutdown，直接返回
+    # 1. Not in shutdown yet, return early
     if not is_shutting_down:
         return
 
-    # 2. 还有容量在用，不能关机
+    # 2. Some capacity still in use, cannot shut down
     if capacity.get_value() != total_capacity:
         return
 
-    # 3. 防止多线程重复终止
+    # 3. Avoid multiple threads terminating at the same time
     with shutdown_lock:
         if termination_started:
             return
         termination_started = True
 
-    # 4. 先更新 DynamoDB，再 terminate 实例
+    # 4. Update DynamoDB first, then terminate the instance
     try:
         instance_id = get_instance_id()
         logger.info(
@@ -323,7 +323,7 @@ def try_shutdown_if_idle():
             instance_id,
         )
 
-        # 写 terminated_time + status = terminated
+        # Write terminated_time + status = terminated
         update_terminated_time(instance_id)
         update_terminated_instance_status(instance_id)
 
@@ -341,11 +341,11 @@ def try_shutdown_if_idle():
 
 def cleanup_token(token: str):
     """
-    统一 token 清理逻辑：
-    - 从 TimeoutCache 删除
+    Unified token cleanup logic:
+    - Remove token from TimeoutCache
     - capacity +1
-    - 释放 backend
-    - 如果 shutdown 且空闲，则尝试关机
+    - Release backend
+    - If we're shutting down and idle, try to shut down
     """
     removed = pass_token_map.remove(token)
     if removed:
@@ -366,9 +366,9 @@ def pre_occupy():
     if is_shutting_down:
         return {"status": "shutting-down"}
     """
-    预留一个执行 slot：
-    - 如果有空闲 capacity + backend，就返回 token
-    - 否则返回 fail
+    Reserve an execution slot:
+    - If there is free capacity + backend, return a token
+    - Otherwise return fail
     """
     num_of_req_map[RESERVE].increment()
     request_data = request.get_json()
@@ -390,7 +390,7 @@ def pre_occupy():
 
             backend = assign_backend_for_token(new_uuid)
             if backend is None:
-                # backend 不够，回滚 capacity
+                # No backend available, rollback capacity
                 capacity.increment()
                 logger.warning(
                     "[RESERVE] no backend available, rollback capacity. token=%s",
@@ -422,9 +422,9 @@ def execute():
     if is_shutting_down:
         return {"status": "shutting-down"}
     """
-    使用预留的 token 执行：
-    - sync: 阻塞直到 Lambda 返回，返回结果
-    - async: 后台线程执行，立刻返回 {"status": "success"}
+    Execute with a reserved token:
+    - sync: block until Lambda returns, then return result
+    - async: run in background thread, immediately return {"status": "success"}
     """
     num_of_req_map[EXECUTE].increment()
     request_data = request.get_json()
@@ -486,10 +486,10 @@ def execute():
 
 def post_and_return(token, data):
     """
-    异步执行：
-    - 根据 token 找 backend
-    - 在 backend.lock 下调用 Lambda
-    - 最后 cleanup_token
+    Asynchronous execution:
+    - Find backend by token
+    - Call Lambda under backend.lock
+    - Finally cleanup_token
     """
     try:
         backend, idx = get_backend_for_token(token)
@@ -521,8 +521,9 @@ def execute_without_reserve():
     if is_shutting_down:
         return {"status": "shutting-down"}
     """
-    不经过预留，直接抢占一个 slot 执行：
-    - 成功时内部也生成一个 token，绑定 backend，用完后释放
+    Execute without reserving:
+    - Directly grab a slot and run
+    - On success, internally generate a token, bind to backend, and release after use
     """
     num_of_req_map[EXECUTE_NO_RESERVE].increment()
     new_uuid = None
@@ -552,7 +553,7 @@ def execute_without_reserve():
                     )
                     return {"status": "fail"}
 
-                # 固定 TTL=2 秒，保持你原来的逻辑
+                # Fixed TTL=2 seconds, keeping your original logic
                 pass_token_map.put(new_uuid, 2)
                 data = request_data["payload"]
 
@@ -593,31 +594,31 @@ def execute_without_reserve():
 @app.route("/rlb/begin_shutdown", methods=["POST"])
 def begin_shutdown():
     """
-    标记当前实例进入关机状态：
-    - 更新 DynamoDB status 为 'shutting-down'
-    - 在 history 表里记录 shutdown_time
-    - 把全局 is_shutting_down 设为 True
-    - 之后所有 /rlb/reserve /rlb/execute /rlb/execute_without_reserve
-      都会直接返回 {"status": "shutting-down"}
+    Mark current instance as entering shutdown state:
+    - Update DynamoDB status to 'shutting-down'
+    - Record shutdown_time in history table
+    - Set global is_shutting_down to True
+    - After this, all /rlb/reserve /rlb/execute /rlb/execute_without_reserve
+      will directly return {"status": "shutting-down"}
 
-    额外：
-    - 如果 total_capacity == current_capacity（说明没有在跑的请求）
-      -> 在 active 表里把 status 记成 'terminated'
-      -> 在 history 表里写 terminated_timestamp
-      -> 直接调用 EC2 terminate 自己
+    Additionally:
+    - If total_capacity == current_capacity (no in-flight requests)
+      -> Set status in active table to 'terminated'
+      -> Write terminated_timestamp in history table
+      -> Directly call EC2 terminate on this instance
     """
     global is_shutting_down, total_capacity, capacity
 
     instance_id = get_instance_id()
 
-    # 1. 标记为 shutting-down + 记录 shutdown_time
+    # 1. Mark as shutting-down + record shutdown_time
     update_shutting_down_instance_status(instance_id)
     update_shutdown_time(instance_id)
 
     is_shutting_down = True
     logger.info("[SHUTDOWN] instance %s is entering shutting-down state", instance_id)
 
-    # 2. 用现成的 total_capacity / current_capacity 做一次检查
+    # 2. Use existing total_capacity / current_capacity for one check
     current_cap = capacity.get_value()
     logger.info(
         "[SHUTDOWN] capacity check: total_capacity=%s, current_capacity=%s",
@@ -628,7 +629,7 @@ def begin_shutdown():
     will_terminate_now = False
 
     if total_capacity == current_cap:
-        # 说明已经没在跑的活了，可以直接认为“空闲可删”
+        # No in-flight work, can treat as idle and safe to delete
         will_terminate_now = True
         logger.info(
             "[SHUTDOWN] no inflight work; marking terminated & terminating self"
@@ -644,7 +645,7 @@ def begin_shutdown():
             num_req_map[i] = num_of_req_map[i].get_value()
         
 
-        # 2.1 更新 active 表里的状态 -> terminated
+        # 2.1 Update status in active table -> terminated
         active_table = ddb.Table("localibou_active_global_vms_table")
         active_table.update_item(
             Key={"key": instance_id},
@@ -657,7 +658,7 @@ def begin_shutdown():
             },
         )
 
-        # 2.2 在 history 表里写 terminated_timestamp
+        # 2.2 Write terminated_timestamp into history table
         history_table = ddb.Table("localibou_ec2_status_history_log")
         ms = time.time_ns() // 1_000_000
         
@@ -676,7 +677,7 @@ def begin_shutdown():
             },
         )
 
-        # 2.3 调用 EC2 terminate self
+        # 2.3 Call EC2 terminate self
         terminate_self(instance_id)
 
     else:
@@ -696,12 +697,12 @@ def begin_shutdown():
 
 
 # ─────────────────────────────────────────
-# DynamoDB / 实例状态相关逻辑
+# DynamoDB / instance status related logic
 # ─────────────────────────────────────────
 
 def updateInstanceStatus(instance_id, local_ip):
     """
-    启动时：从 init -> running，同时写入 public_ip
+    On startup: transition from init -> running, and write public_ip
     """
     dynamodb = boto3.resource("dynamodb", region_name="ca-west-1")
     decision_table = dynamodb.Table("localibou_active_global_vms_table")
@@ -726,7 +727,7 @@ def updateInstanceStatus(instance_id, local_ip):
 
 def update_shutting_down_instance_status(instance_id):
     """
-    进入 shutting-down 阶段时：status = 'shutting-down'
+    When entering shutting-down phase: set status = 'shutting-down'
     """
     try:
         dynamodb = boto3.resource("dynamodb", region_name="ca-west-1")
@@ -755,7 +756,7 @@ def update_shutting_down_instance_status(instance_id):
 
 def update_terminated_instance_status(instance_id):
     """
-    即将 terminate 前：status = 'terminated'
+    Right before terminate: set status = 'terminated'
     """
     try:
         dynamodb = boto3.resource("dynamodb", region_name="ca-west-1")
@@ -773,7 +774,7 @@ def update_terminated_instance_status(instance_id):
         )
         return response
     except Exception as e:
-        # 打 log，但不要阻止真正的 terminate
+        # Log the error but do not block actual termination
         logger.exception(
             "[SHUTDOWN] Failed to update terminated status in DynamoDB for %s: %s",
             instance_id,
@@ -784,7 +785,7 @@ def update_terminated_instance_status(instance_id):
 
 def update_running_new_machine_history(instance_id):
     """
-    在 history 表里记录 running_time（毫秒时间戳）
+    Record running_time (millisecond timestamp) in history table
     """
     ms = time.time_ns() // 1_000_000
     try:
@@ -808,7 +809,7 @@ def update_running_new_machine_history(instance_id):
 
 def update_shutdown_time(instance_id):
     """
-    在 history 表里记录 shutdown_time（毫秒时间戳）
+    Record shutdown_time (millisecond timestamp) in history table
     """
     ms = time.time_ns() // 1_000_000
     try:
@@ -832,7 +833,7 @@ def update_shutdown_time(instance_id):
 
 def update_terminated_time(instance_id):
     """
-    在 history 表里记录 terminated_time（毫秒时间戳）
+    Record terminated_time (millisecond timestamp) in history table
     """
     ms = time.time_ns() // 1_000_000
     try:
@@ -898,22 +899,22 @@ import requests
 
 def get_current_region_from_imds(timeout: float = 1.0) -> str:
     """
-    使用 EC2 Instance Metadata Service (IMDSv2) 获取当前实例所在的 AWS Region。
-    只在 EC2 上可用。
+    Use EC2 Instance Metadata Service (IMDSv2) to get the current instance's AWS region.
+    Only works on EC2.
 
-    :param timeout: 每次 HTTP 请求的超时时间（秒）
-    :return: 形如 'us-west-2' 的 region 字符串
-    :raises RuntimeError: 如果无法从 IMDS 取到 region
+    :param timeout: Timeout (seconds) for each HTTP request
+    :return: Region string like 'us-west-2'
+    :raises RuntimeError: If unable to retrieve region from IMDS
     """
     try:
-        # 1) 获取 IMDSv2 token（等价于 shell 的第一条 curl）
+        # 1) Get IMDSv2 token (equivalent to the first curl)
         token = requests.put(
             "http://169.254.169.254/latest/api/token",
             headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"},
             timeout=timeout,
         ).text
 
-        # 2) 用 token 去拿 instance-identity document（等价于第二条 curl）
+        # 2) Use the token to get the instance-identity document (equivalent to the second curl)
         resp = requests.get(
             "http://169.254.169.254/latest/dynamic/instance-identity/document",
             headers={"X-aws-ec2-metadata-token": token},
@@ -933,7 +934,7 @@ def get_current_region_from_imds(timeout: float = 1.0) -> str:
 
 
 # ─────────────────────────────────────────
-# main：初始化 capacity / backends / pass_token_map
+# main: initialize capacity / backends / pass_token_map
 # ─────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -941,20 +942,20 @@ if __name__ == "__main__":
         raise SystemExit("Usage: python random_server.py <capacity>")
 
 
-    capacity_value = int(sys.argv[1])  # capacity = 容器数（replicas）
+    capacity_value = int(sys.argv[1])  # capacity = number of containers (replicas)
     capacity = AtomicInteger(capacity_value)
     pass_token_map = TimeoutCache()
 
-    # 初始状态不在 shutdown
+    # Initial state: not in shutdown
     is_shutting_down = False
-    # 记录总 capacity，用于判断“是否完全空闲”
+    # Record total capacity, used to determine "fully idle"
     total_capacity = capacity_value
 
-    # BACKEND_BASE_PORT: 第一个容器的 host 端口，默认 8080
+    # BACKEND_BASE_PORT: host port mapped to the first container, default 8080
     base_port = int(os.environ.get("BACKEND_BASE_PORT", "8080"))
     backend_host = os.environ.get("BACKEND_HOST", "localhost")
 
-    # 根据 capacity 建立 backend 列表
+    # Build backend list according to capacity
     for i in range(capacity_value):
         port = base_port + i
         url = f"http://{backend_host}:{port}/2015-03-31/functions/function/invocations"
