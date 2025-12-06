@@ -634,25 +634,31 @@ def begin_shutdown():
         active_table.update_item(
             Key={"key": instance_id},
             UpdateExpression=(
-                "SET #s = :terminated, "
-                "exec_time_map = :exec_map, "
-                "req_num_map = :req_map"
+                "SET #s = :terminated"
             ),
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={
                 ":terminated": "terminated",
-                ":exec_map": str(time_exec_map),
-                ":req_map": str(num_of_req_map),
             },
         )
 
         # 2.2 在 history 表里写 terminated_timestamp
         history_table = ddb.Table("localibou_ec2_status_history_log")
         ms = time.time_ns() // 1_000_000
+        
         history_table.update_item(
             Key={"ec2_id": instance_id},
-            UpdateExpression="SET terminated_timestamp = :ts",
-            ExpressionAttributeValues={":ts": ms},
+            UpdateExpression=(
+                "SET terminated_timestamp = :ts, "
+                "exec_time_map = :exec_map, "
+                "req_num_map = :req_map"
+                              
+            ),
+            ExpressionAttributeValues={
+                ":ts": ms,
+                ":exec_map": str(time_exec_map),
+                ":req_map": str(num_of_req_map),
+            },
         )
 
         # 2.3 调用 EC2 terminate self
